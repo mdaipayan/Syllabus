@@ -73,8 +73,6 @@ def _check_text(text: str) -> tuple[list[dict], str]:
         {
             "message": m.message,
             "context": m.context,
-            "offset": m.offset,
-            "length": m.errorLength,
             "replacements": m.replacements[:4],
             "rule": m.ruleId,
         }
