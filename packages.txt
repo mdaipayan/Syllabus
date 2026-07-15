@@ -1,0 +1,7 @@
+freeglut3-dev
+libgl1-mesa-dev
+libglu1-mesa-dev
+texlive-latex-base
+texlive-latex-extra
+texlive-fonts-recommended
+latexmk
