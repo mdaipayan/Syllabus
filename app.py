@@ -6,7 +6,13 @@ from typing import Any
 
 import streamlit as st
 
-from draft_io import DraftError, draft_file_name, draft_from_json, draft_to_json
+from draft_io import (
+    DraftError,
+    draft_file_name,
+    draft_from_json,
+    draft_to_json,
+    subject_file_stem,
+)
 from pdf_extractor import PdfExtractionError, extract_syllabus_fields
 from syllabus_generator import SyllabusData, compile_pdf, render_lab_latex, render_theory_latex
 
@@ -524,20 +530,23 @@ def render_signatory_controls(page_name: str, checkbox_attr: str) -> None:
         text_input("Signature 3", "principal")
 
 
-def render_export_panel(page_name: str, latex_content: str, file_stem: str, signed: bool) -> None:
+def render_export_panel(
+    page_name: str, latex_content: str, file_stem: str, signed: bool, download_stem: str
+) -> None:
+    """file_stem is internal (state keys, TeX job name); download_stem names the files."""
     st.subheader(f"{page_name} Downloads")
     st.caption("Generate this page only. Theory and Lab downloads are separate and do not include each other.")
 
     pdf_state_key = f"{file_stem}_pdf_bytes"
     # Different names so the signed and unsigned PDFs don't overwrite each other.
-    pdf_name = f"{file_stem}_{'with' if signed else 'without'}_signature.pdf"
+    pdf_name = f"{download_stem}_{'with' if signed else 'without'}_signature.pdf"
     preview_tab, latex_tab = st.tabs(["Generate & Download", "LaTeX Source"])
 
     with preview_tab:
         st.download_button(
             f"Download {page_name} LaTeX",
             data=latex_content,
-            file_name=f"{file_stem}.tex",
+            file_name=f"{download_stem}.tex",
             mime="text/plain",
             key=f"download_{file_stem}_latex_direct",
         )
@@ -731,7 +740,11 @@ if current_page == "Theory Page":
     render_signatory_controls("Theory", "include_theory_signature_box")
     sync_data_from_editor_state(data)
     render_export_panel(
-        "Theory", render_theory_latex(data), "theory_syllabus", data.include_theory_signature_box
+        "Theory",
+        render_theory_latex(data),
+        "theory_syllabus",
+        data.include_theory_signature_box,
+        subject_file_stem(data.subject_code, data.title, "theory_syllabus"),
     )
 
 else:
@@ -759,4 +772,10 @@ else:
     render_grammar_panel("Lab Page")
     render_signatory_controls("Lab", "include_lab_signature_box")
     sync_data_from_editor_state(data)
-    render_export_panel("Lab", render_lab_latex(data), "lab_syllabus", data.include_lab_signature_box)
+    render_export_panel(
+        "Lab",
+        render_lab_latex(data),
+        "lab_syllabus",
+        data.include_lab_signature_box,
+        subject_file_stem(data.lab_subject_code, data.lab_table_title, "lab_syllabus"),
+    )
