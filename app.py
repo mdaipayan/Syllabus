@@ -463,7 +463,10 @@ def render_export_panel(page_name: str, latex_content: str, file_stem: str, sign
         )
         if st.button(f"Generate {page_name} PDF", type="primary", key=f"generate_{file_stem}_pdf"):
             try:
-                pdf_bytes, _ = compile_pdf(latex_content, output_stem=file_stem)
+                with st.spinner(
+                    "Generating PDF… (the first time, Times New Roman is downloaded; this can take a minute)"
+                ):
+                    pdf_bytes, _ = compile_pdf(latex_content, output_stem=file_stem)
                 st.session_state[pdf_state_key] = pdf_bytes
                 st.success(f"{page_name} PDF generated successfully.")
             except Exception as exc:

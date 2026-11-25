@@ -1,6 +1,7 @@
 texlive-xetex
 texlive-latex-extra
 texlive-fonts-recommended
-fonts-texgyre
 latexmk
+fontconfig
+cabextract
 default-jre-headless

@@ -5,7 +5,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import urllib.request
 from typing import List
 
 
@@ -245,9 +248,7 @@ def _document(content: str, data: SyllabusData, include_signatures: bool) -> str
 \PackageError{{syllabus-generator}}{{This template requires XeLaTeX or LuaLaTeX for Times New Roman}}{{Use xelatex or lualatex to compile this document.}}
 \else
 \usepackage{{fontspec}}
-% Times New Roman is not installed on Linux hosts (e.g. Streamlit Cloud);
-% TeX Gyre Termes is a free, near-identical Times clone.
-\IfFontExistsTF{{Times New Roman}}{{\setmainfont{{Times New Roman}}}}{{\setmainfont{{TeX Gyre Termes}}}}
+\setmainfont{{Times New Roman}}
 \fi
 \usepackage[margin=1in, bottom=1.5in]{{geometry}}
 \usepackage[table]{{xcolor}}
@@ -432,6 +433,95 @@ def render_latex(data: SyllabusData) -> str:
     return render_theory_latex(data)
 
 
+# ---------------------------------------------------------------------------
+# Real Times New Roman on Linux hosts (e.g. Streamlit Cloud)
+# ---------------------------------------------------------------------------
+# Linux servers do not ship Times New Roman. Microsoft's free "Core fonts for
+# the Web" package (times32.exe) contains the genuine font; it is the same
+# download Debian's ttf-mscorefonts-installer uses. It is fetched once, unpacked
+# with cabextract into the user's font folder and registered with fontconfig,
+# which XeLaTeX uses to find fonts. Using it means accepting Microsoft's
+# Core Fonts EULA (see README).
+TIMES_FONT_URLS = (
+    "https://downloads.sourceforge.net/corefonts/times32.exe",
+    "https://sourceforge.net/projects/corefonts/files/the%20fonts/final/times32.exe/download",
+)
+TIMES_FONT_FILES = ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf")
+FONT_INSTALL_DIR = Path.home() / ".fonts" / "msttcorefonts"
+_FONT_LOCK = threading.Lock()
+
+
+def times_new_roman_installed() -> bool:
+    """True if fontconfig can see a real Times New Roman (not a substitute)."""
+    if shutil.which("fc-list") is None:
+        # Windows/macOS without fontconfig: Times New Roman ships with the OS.
+        return sys.platform in ("win32", "darwin")
+    result = subprocess.run(
+        ["fc-list", ":family=Times New Roman", "family"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    return bool(result.stdout.strip())
+
+
+def _download(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def ensure_times_new_roman() -> None:
+    """Install the genuine Times New Roman for this user if it is missing."""
+    with _FONT_LOCK:
+        if times_new_roman_installed():
+            return
+        if shutil.which("cabextract") is None or shutil.which("fc-cache") is None:
+            raise RuntimeError(
+                "Times New Roman is not installed, and it cannot be installed "
+                "automatically because 'cabextract' or 'fontconfig' is missing. "
+                "Add both to packages.txt (Streamlit Cloud) or install Times New Roman."
+            )
+
+        errors: list[str] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            exe_path = temp_path / "times32.exe"
+            for url in TIMES_FONT_URLS:
+                try:
+                    payload = _download(url)
+                except Exception as exc:  # network errors, HTTP errors, timeouts
+                    errors.append(f"{url}: {exc}")
+                    continue
+                if payload[:2] != b"MZ":  # a mirror page instead of the installer
+                    errors.append(f"{url}: not a font package")
+                    continue
+                exe_path.write_bytes(payload)
+                break
+            else:
+                raise RuntimeError(
+                    "Could not download Times New Roman:\n" + "\n".join(errors)
+                )
+
+            extract_dir = temp_path / "fonts"
+            extract_dir.mkdir()
+            subprocess.run(
+                ["cabextract", "-q", "-L", "-d", str(extract_dir), str(exe_path)],
+                capture_output=True, check=True, timeout=60,
+            )
+            FONT_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            for name in TIMES_FONT_FILES:
+                source = extract_dir / name
+                if not source.exists():
+                    raise RuntimeError(f"Font package did not contain {name}.")
+                shutil.copy2(source, FONT_INSTALL_DIR / name)
+
+        subprocess.run(
+            ["fc-cache", "-f", str(FONT_INSTALL_DIR)],
+            capture_output=True, check=False, timeout=120,
+        )
+        if not times_new_roman_installed():
+            raise RuntimeError("Times New Roman was downloaded but fontconfig cannot see it.")
+
+
 TEX_TIMEOUT_SECONDS = 120
 LOG_TAIL_LINES = 40
 
@@ -471,6 +561,9 @@ def compile_pdf(latex_content: str, output_stem: str = "syllabus") -> tuple[byte
             "(e.g. MiKTeX or TeX Live) that provides latexmk with XeLaTeX, xelatex, "
             "or lualatex."
         )
+
+    # Never fall back to a look-alike font: the syllabus must use the real one.
+    ensure_times_new_roman()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
