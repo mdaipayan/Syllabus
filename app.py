@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import fields
 from typing import Any
@@ -1128,10 +1129,106 @@ if "data" not in st.session_state:
 
 
 data: SyllabusData = st.session_state.data
+PAGE_KEY = "editor_page"
+_PAGE_LAST_KEY = "_editor_page_last"
+_PAGE_SCROLL_KEY = "_editor_page_scroll_top"
+THEORY_PAGE, LAB_PAGE = "Theory Page", "Lab Page"
+_PAGE_LABELS = {THEORY_PAGE: "📘 Theory page", LAB_PAGE: "🧪 Lab page"}
+
+
+def _on_page_change() -> None:
+    # Clicking the selected button again would leave no page selected: keep the old one.
+    if st.session_state.get(PAGE_KEY) not in _PAGE_LABELS:
+        st.session_state[PAGE_KEY] = st.session_state.get(_PAGE_LAST_KEY, THEORY_PAGE)
+    st.session_state[_PAGE_LAST_KEY] = st.session_state[PAGE_KEY]
+
+
+def _go_to_page(page: str) -> None:
+    st.session_state[PAGE_KEY] = page
+    st.session_state[_PAGE_LAST_KEY] = page
+    st.session_state[_PAGE_SCROLL_KEY] = True
+
+
+def render_page_switch() -> str:
+    """Big Theory/Lab switch at the top of the page. Returns the open page."""
+    if st.session_state.get(PAGE_KEY) not in _PAGE_LABELS:
+        st.session_state[PAGE_KEY] = st.session_state.get(_PAGE_LAST_KEY, THEORY_PAGE)
+    extra = {"required": True} if "required" in inspect.signature(st.segmented_control).parameters else {}
+    st.segmented_control(
+        "Which page are you editing?",
+        list(_PAGE_LABELS),
+        key=PAGE_KEY,
+        format_func=_PAGE_LABELS.get,
+        on_change=_on_page_change,
+        width="stretch",
+        **extra,
+    )
+    page = st.session_state.get(PAGE_KEY) or THEORY_PAGE
+    other = LAB_PAGE if page == THEORY_PAGE else THEORY_PAGE
+    st.caption(
+        f"You are editing the **{_PAGE_LABELS[page]}**. The {_PAGE_LABELS[other]} is "
+        "separate and gets its own PDF. Save draft, PDF import and Auto-correct are in "
+        "the sidebar (on a phone, tap **»** at the top-left to open it)."
+    )
+    if st.session_state.pop(_PAGE_SCROLL_KEY, False):
+        _scroll_to_top()
+    return page
+
+
+_SCROLL_JS = """
+const doc = (window.parent && window.parent.document) || document;
+for (const sel of ['[data-testid="stMain"]', '[data-testid="stAppViewContainer"]', 'section.main']) {
+  const el = doc.querySelector(sel); if (el) { el.scrollTo({top: 0}); }
+}
+(window.parent || window).scrollTo({top: 0});
+"""
+
+
+def _scroll_to_top() -> None:
+    """After Next/Back at the bottom of a page, jump to the top of the new page.
+
+    Uses st.html with JavaScript (runs in the page) where available; older
+    Streamlit versions fall back to a zero-height component iframe.
+    """
+    try:
+        if "unsafe_allow_javascript" in inspect.signature(st.html).parameters:
+            st.html(f"<script>{_SCROLL_JS}</script>", unsafe_allow_javascript=True)
+            return
+        if hasattr(st, "iframe"):
+            st.iframe(f"<script>{_SCROLL_JS}</script>", height=1)
+            return
+        import streamlit.components.v1 as components  # removed in newer Streamlit
+
+        components.html(f"<script>{_SCROLL_JS}</script>", height=0)
+    except Exception:
+        pass  # scrolling is a convenience; never break the page for it
+
+
+def render_page_heading(page: str) -> None:
+    if page == THEORY_PAGE:
+        st.header("📘 Theory page", divider="blue")
+        st.caption("Step 1 of 2 — course details, objectives, outcomes, units and books.")
+    else:
+        st.header("🧪 Lab page", divider="green")
+        st.caption("Step 2 of 2 — lab details, objectives, outcomes and experiments. "
+                   "It is not added to the Theory PDF.")
+
+
+def render_page_footer_nav(page: str) -> None:
+    st.divider()
+    if page == THEORY_PAGE:
+        st.button("Next: 🧪 Lab page →", key="nav_to_lab", on_click=_go_to_page,
+                  args=(LAB_PAGE,), type="primary", width="stretch")
+    else:
+        st.button("← Back to 📘 Theory page", key="nav_to_theory", on_click=_go_to_page,
+                  args=(THEORY_PAGE,), width="stretch")
+
+
 start_editor_run(data)
 
 with st.sidebar:
-    st.header("Actions")
+    st.header("Tools")
+    st.caption("Switch between the **Theory** and **Lab** pages with the big buttons at the top of the page.")
     if st.button("Reset to default"):
         reset_editor_state()
         st.rerun()
@@ -1238,12 +1335,8 @@ with st.sidebar:
         st.caption("Grammar engine not installed: only lines and spaces will be fixed.")
     st.caption("To fix text already in the boxes, use **✨ Clean up all fields** on the page.")
 
-    st.divider()
-    current_page = st.radio(
-        "Editor Pages",
-        ["Theory Page", "Lab Page"],
-        help="Each page is edited, generated, and downloaded separately.",
-    )
+
+current_page = render_page_switch()
 
 st.info(
     "Your edits are saved automatically when you move to another field, click "
@@ -1260,8 +1353,8 @@ st.button(
 )
 render_auto_correct_notice()
 
-if current_page == "Theory Page":
-    st.subheader("Theory Details")
+if current_page == THEORY_PAGE:
+    render_page_heading(THEORY_PAGE)
     text_input("Course Title", "title")
     text_input("Subject Code", "subject_code")
     meta1, meta2 = st.columns(2)
@@ -1297,10 +1390,10 @@ if current_page == "Theory Page":
         data.include_theory_signature_box,
         subject_file_stem(data.subject_code, data.title, "theory_syllabus"),
     )
+    render_page_footer_nav(THEORY_PAGE)
 
 else:
-    st.subheader("Lab Details")
-    st.caption("The Lab page is independent. It will not be added to the Theory PDF.")
+    render_page_heading(LAB_PAGE)
     text_input("Lab Table Title", "lab_table_title")
     text_input("Lab Section Title", "lab_section_title")
     text_input("Lab Subject Code", "lab_subject_code")
@@ -1331,3 +1424,4 @@ else:
         data.include_lab_signature_box,
         subject_file_stem(data.lab_subject_code, data.lab_table_title, "lab_syllabus"),
     )
+    render_page_footer_nav(LAB_PAGE)
