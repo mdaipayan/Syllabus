@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import hashlib
 import re
 import shutil
 import subprocess
@@ -437,14 +438,17 @@ def render_latex(data: SyllabusData) -> str:
 # Real Times New Roman on Linux hosts (e.g. Streamlit Cloud)
 # ---------------------------------------------------------------------------
 # Linux servers do not ship Times New Roman. Microsoft's free "Core fonts for
-# the Web" package (times32.exe) contains the genuine font; it is the same
-# download Debian's ttf-mscorefonts-installer uses. It is fetched once, unpacked
-# with cabextract into the user's font folder and registered with fontconfig,
-# which XeLaTeX uses to find fonts. Using it means accepting Microsoft's
-# Core Fonts EULA (see README).
+# the Web" package (times32.exe) contains the genuine font; its EULA allows the
+# original, unmodified installer to be redistributed, so it is bundled in
+# fonts/times32.exe. On first use it is unpacked with cabextract into the
+# user's font folder and registered with fontconfig, which XeLaTeX uses to
+# find fonts. The download URLs are only a fallback (SourceForge blocks many
+# cloud servers, including Streamlit Cloud).
+BUNDLED_TIMES_EXE = Path(__file__).resolve().parent / "fonts" / "times32.exe"
+TIMES_EXE_SHA256 = "db56595ec6ef5d3de5c24994f001f03b2a13e37cee27bc25c58f6f43e8f807ab"
 TIMES_FONT_URLS = (
+    "https://raw.githubusercontent.com/pushcx/corefonts/master/times32.exe",
     "https://downloads.sourceforge.net/corefonts/times32.exe",
-    "https://sourceforge.net/projects/corefonts/files/the%20fonts/final/times32.exe/download",
 )
 TIMES_FONT_FILES = ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf")
 FONT_INSTALL_DIR = Path.home() / ".fonts" / "msttcorefonts"
@@ -469,6 +473,30 @@ def _download(url: str) -> bytes:
         return response.read()
 
 
+def _is_genuine_installer(payload: bytes) -> bool:
+    return hashlib.sha256(payload).hexdigest() == TIMES_EXE_SHA256
+
+
+def _times_installer_bytes() -> bytes:
+    """Return the verified times32.exe: the bundled copy, else a download."""
+    errors: list[str] = []
+    if BUNDLED_TIMES_EXE.exists():
+        payload = BUNDLED_TIMES_EXE.read_bytes()
+        if _is_genuine_installer(payload):
+            return payload
+        errors.append(f"{BUNDLED_TIMES_EXE}: checksum mismatch (file damaged?)")
+    for url in TIMES_FONT_URLS:
+        try:
+            payload = _download(url)
+        except Exception as exc:  # network errors, HTTP errors, timeouts
+            errors.append(f"{url}: {exc}")
+            continue
+        if _is_genuine_installer(payload):
+            return payload
+        errors.append(f"{url}: checksum mismatch")
+    raise RuntimeError("Could not get Times New Roman:\n" + "\n".join(errors))
+
+
 def ensure_times_new_roman() -> None:
     """Install the genuine Times New Roman for this user if it is missing."""
     with _FONT_LOCK:
@@ -481,25 +509,10 @@ def ensure_times_new_roman() -> None:
                 "Add both to packages.txt (Streamlit Cloud) or install Times New Roman."
             )
 
-        errors: list[str] = []
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             exe_path = temp_path / "times32.exe"
-            for url in TIMES_FONT_URLS:
-                try:
-                    payload = _download(url)
-                except Exception as exc:  # network errors, HTTP errors, timeouts
-                    errors.append(f"{url}: {exc}")
-                    continue
-                if payload[:2] != b"MZ":  # a mirror page instead of the installer
-                    errors.append(f"{url}: not a font package")
-                    continue
-                exe_path.write_bytes(payload)
-                break
-            else:
-                raise RuntimeError(
-                    "Could not download Times New Roman:\n" + "\n".join(errors)
-                )
+            exe_path.write_bytes(_times_installer_bytes())
 
             extract_dir = temp_path / "fonts"
             extract_dir.mkdir()
