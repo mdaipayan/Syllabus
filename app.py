@@ -292,20 +292,50 @@ def syllabus_field_names() -> list[str]:
     return [field.name for field in fields(SyllabusData)]
 
 
-def initialize_editor_state(data: SyllabusData) -> None:
-    """Prime Streamlit widget state once so reruns never overwrite in-progress edits."""
-    for field_name in syllabus_field_names():
-        key = editor_key(field_name)
-        if key not in st.session_state:
-            st.session_state[key] = widget_value_from_data(data, field_name)
+# Which editor fields had a widget on screen in the current / previous run.
+_RENDERED_NOW_KEY = "_editor_rendered_now"
+_RENDERED_PREV_KEY = "_editor_rendered_prev"
 
 
-def sync_data_from_editor_state(data: SyllabusData) -> None:
-    """Copy committed widget state into the dataclass used by the LaTeX renderer."""
-    for field_name in syllabus_field_names():
+def start_editor_run(data: SyllabusData) -> None:
+    """Call once at the top of every run, before any editor widget is created.
+
+    `data` (the SyllabusData in session state) is the master copy of every
+    field. Only boxes that were on screen in the previous run hold fresh
+    values, so only those are copied into `data`. Boxes of the hidden page
+    are left alone: Streamlit may already have dropped or blanked them.
+    """
+    previous = set(st.session_state.get(_RENDERED_NOW_KEY, ()))
+    st.session_state[_RENDERED_PREV_KEY] = previous
+    st.session_state[_RENDERED_NOW_KEY] = set()
+    for field_name in previous:
         key = editor_key(field_name)
         if key in st.session_state:
             setattr(data, field_name, data_value_from_widget(field_name, st.session_state[key]))
+
+
+def sync_data_from_editor_state(data: SyllabusData) -> None:
+    """Copy values of boxes drawn so far in this run into the dataclass."""
+    for field_name in st.session_state.get(_RENDERED_NOW_KEY, ()):
+        key = editor_key(field_name)
+        if key in st.session_state:
+            setattr(data, field_name, data_value_from_widget(field_name, st.session_state[key]))
+
+
+def _prepare_editor_widget(field_name: str) -> str:
+    """Return the widget key, filling the box from `data` only when needed.
+
+    A value is pushed into a box only if that box was NOT on screen in the
+    previous run (first load, page switch, reset). Pushing values into a
+    box that is already shown makes Streamlit overwrite whatever the user is
+    typing there, which made edits "change back".
+    """
+    key = editor_key(field_name)
+    previous = st.session_state.get(_RENDERED_PREV_KEY, set())
+    if field_name not in previous or key not in st.session_state:
+        st.session_state[key] = widget_value_from_data(st.session_state.data, field_name)
+    st.session_state[_RENDERED_NOW_KEY].add(field_name)
+    return key
 
 
 def clear_generated_pdfs() -> None:
@@ -337,28 +367,16 @@ def apply_extracted_fields(extracted: dict[str, Any]) -> None:
     clear_generated_pdfs()
 
 
-def keep_editor_state() -> None:
-    """Stop Streamlit from deleting the state of widgets not drawn in this run.
-
-    Streamlit removes a keyed widget's value when a rerun does not draw that
-    widget (e.g. the Theory/Lab page the user isn't viewing). Re-assigning each
-    key at the top of the script turns it into normal session state, so it
-    survives page switches. Must run before any editor widget is created.
-    """
-    for field_name in syllabus_field_names():
-        key = editor_key(field_name)
-        if key in st.session_state:
-            st.session_state[key] = st.session_state[key]
-
-
 def text_input(label: str, field_name: str, **kwargs: Any) -> str:
-    return st.text_input(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
+    key = _prepare_editor_widget(field_name)
+    return st.text_input(label, key=key, on_change=clear_generated_pdfs, **kwargs)
 
 
 def text_area(label: str, field_name: str, **kwargs: Any) -> str:
+    key = _prepare_editor_widget(field_name)
     return st.text_area(
         label,
-        key=editor_key(field_name),
+        key=key,
         on_change=_on_editor_change,
         args=(field_name,),
         **kwargs,
@@ -366,7 +384,8 @@ def text_area(label: str, field_name: str, **kwargs: Any) -> str:
 
 
 def checkbox(label: str, field_name: str, **kwargs: Any) -> bool:
-    return st.checkbox(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
+    key = _prepare_editor_widget(field_name)
+    return st.checkbox(label, key=key, on_change=clear_generated_pdfs, **kwargs)
 
 
 # "UNIT III: Title" for theory syllabi; "Phase I: ..." for Project/Internship weekly plans.
@@ -586,9 +605,7 @@ if "data" not in st.session_state:
 
 
 data: SyllabusData = st.session_state.data
-keep_editor_state()
-initialize_editor_state(data)
-sync_data_from_editor_state(data)
+start_editor_run(data)
 
 with st.sidebar:
     st.header("Actions")
