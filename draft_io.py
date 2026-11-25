@@ -106,8 +106,17 @@ def draft_from_json(raw: bytes | str) -> dict[str, Any]:
     return result
 
 
+def subject_file_stem(subject_code: str, subject_name: str, fallback: str) -> str:
+    """Safe file name stem from subject code + name, e.g. PCCCE5T001_Fluid_Mechanics.
+
+    Anything other than letters and digits becomes "_" so the name works on
+    Windows, macOS and phones. Falls back when both parts are empty.
+    """
+    parts = [p for p in (subject_code, subject_name) if p and p.strip()]
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", "_".join(parts)).strip("_")[:80]
+    return slug or fallback
+
+
 def draft_file_name(data: SyllabusData) -> str:
     """e.g. draft_BTCE301T_Fluid_Mechanics.json"""
-    parts = [p for p in (data.subject_code, data.title) if p and p.strip()]
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", "_".join(parts)).strip("_")[:60]
-    return f"draft_{slug or 'syllabus'}.json"
+    return f"draft_{subject_file_stem(data.subject_code, data.title, 'syllabus')}.json"

@@ -1,7 +1,14 @@
 import json
 import unittest
 
-from draft_io import DRAFT_FORMAT, DraftError, draft_file_name, draft_from_json, draft_to_json
+from draft_io import (
+    DRAFT_FORMAT,
+    DraftError,
+    draft_file_name,
+    draft_from_json,
+    draft_to_json,
+    subject_file_stem,
+)
 from syllabus_generator import SyllabusData
 
 
@@ -65,6 +72,20 @@ class DraftFileNameTests(unittest.TestCase):
         data = SyllabusData()
         data.subject_code, data.title = "", "  "
         self.assertEqual(draft_file_name(data), "draft_syllabus.json")
+
+
+class SubjectFileStemTests(unittest.TestCase):
+    def test_code_and_name(self):
+        self.assertEqual(subject_file_stem("PCCCE5T001", "Fluid Mechanics", "x"), "PCCCE5T001_Fluid_Mechanics")
+
+    def test_unsafe_characters_replaced(self):
+        self.assertEqual(subject_file_stem("CE-301", "Design of R.C.C. / Steel", "x"), "CE_301_Design_of_R_C_C_Steel")
+
+    def test_only_name(self):
+        self.assertEqual(subject_file_stem("", "Fluid Mechanics Lab", "x"), "Fluid_Mechanics_Lab")
+
+    def test_fallback(self):
+        self.assertEqual(subject_file_stem(" ", "", "lab_syllabus"), "lab_syllabus")
 
 
 if __name__ == "__main__":
