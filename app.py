@@ -15,6 +15,7 @@ from draft_io import (
 )
 from pdf_extractor import PdfExtractionError, extract_syllabus_fields
 from syllabus_generator import SyllabusData, compile_pdf, render_lab_latex, render_theory_latex
+from text_cleanup import clean_field_text
 
 try:
     import language_tool_python
@@ -162,56 +163,113 @@ def _apply_grammar_fixes(page_name: str, field_names: list[str]) -> None:
 
 AUTO_GRAMMAR_KEY = "_auto_grammar_enabled"
 _AUTO_NOTICE_KEY = "_auto_grammar_notice"
-# Fields auto-correct may change: every grammar-checked field except book lists.
+# Fields auto-correct may grammar-check: every grammar field except book lists.
 _AUTO_GRAMMAR_FIELDS = {
     name
     for names in _GRAMMAR_FIELDS.values()
     for name in names
     if name not in _APPLY_ALL_EXCLUDED
 }
+# Every field edited as text (everything except the checkboxes).
+_TEXT_FIELDS = [
+    f.name for f in fields(SyllabusData) if not isinstance(getattr(SyllabusData(), f.name), bool)
+]
+
+
+def _field_label(field_name: str) -> str:
+    return _GRAMMAR_LABELS.get(field_name, field_name.replace("_", " ").title())
+
+
+def _current_text(field_name: str) -> str:
+    """Latest text of a field.
+
+    Inside a button/edit callback, boxes drawn in the last run hold the
+    newest text. Otherwise the master copy in `data` is up to date.
+    """
+    key = editor_key(field_name)
+    if field_name in st.session_state.get(_RENDERED_NOW_KEY, set()) and key in st.session_state:
+        return str(st.session_state[key])
+    return str(widget_value_from_data(st.session_state.data, field_name))
+
+
+def _set_text(field_name: str, text: str) -> None:
+    """Write a field to both the master copy and its box.
+
+    Only call from a callback or before the box is drawn in this run.
+    """
+    setattr(st.session_state.data, field_name, data_value_from_widget(field_name, text))
+    st.session_state[editor_key(field_name)] = text
+
+
+def _clean_one(field_name: str, text: str, *, join_wrapped: bool, grammar: bool) -> tuple[str, int]:
+    """Lines/spaces/bullets/headings, then grammar. Returns (text, grammar fixes)."""
+    cleaned = clean_field_text(field_name, text, join_wrapped=join_wrapped)
+    if not grammar or field_name not in _AUTO_GRAMMAR_FIELDS or not cleaned.strip():
+        return cleaned, 0
+    matches, corrected = _check_text(cleaned)
+    if not matches:
+        return cleaned, 0
+    # Grammar fixes can leave odd spacing; tidy once more.
+    return clean_field_text(field_name, corrected), len(matches)
+
+
+def clean_fields(field_names: list[str], *, join_wrapped: bool, grammar: bool, label: str) -> None:
+    """Clean several fields and leave a notice with Undo.
+
+    join_wrapped=True also joins lines a PDF broke mid-sentence; used for
+    imports and "Clean up all fields", not for normal typing.
+    """
+    grammar_ok = grammar and _load_grammar_tool() is not None
+    changes: dict[str, tuple[str, str]] = {}
+    grammar_fixes = 0
+    failed: list[str] = []
+    for field_name in field_names:
+        old = _current_text(field_name)
+        try:
+            new, fixes = _clean_one(field_name, old, join_wrapped=join_wrapped, grammar=grammar_ok)
+        except Exception:
+            failed.append(_field_label(field_name))
+            new, fixes = clean_field_text(field_name, old, join_wrapped=join_wrapped), 0
+        if new != old:
+            _set_text(field_name, new)
+            changes[field_name] = (old, new)
+            grammar_fixes += fixes
+
+    notice: dict[str, Any] = {"label": label, "changes": changes, "grammar_fixes": grammar_fixes}
+    if grammar and not grammar_ok:
+        notice["warning"] = (
+            "Grammar was skipped: the grammar engine did not start (no Java, and the "
+            "public LanguageTool service could not be reached). Lines and spaces were still fixed."
+        )
+    elif failed:
+        notice["warning"] = "Grammar check failed for: " + ", ".join(failed) + "."
+    if changes or "warning" in notice:
+        st.session_state[_AUTO_NOTICE_KEY] = notice
+    if changes:
+        clear_generated_pdfs()
 
 
 def _on_editor_change(field_name: str) -> None:
-    """on_change callback for editor widgets.
+    """on_change callback for editor boxes.
 
-    Runs before the script redraws the widgets, so it may replace the text.
-    With auto-correct on, the edited field is grammar-checked and fixed
-    straight away, and the original is kept so the user can undo.
+    Runs before the script redraws the boxes, so it may replace the text.
+    With auto-correct on, the edited box is cleaned straight away.
     """
     clear_generated_pdfs()
-    if not st.session_state.get(AUTO_GRAMMAR_KEY) or field_name not in _AUTO_GRAMMAR_FIELDS:
-        return
-    key = editor_key(field_name)
-    original = str(st.session_state.get(key, ""))
-    if _load_grammar_tool() is None:
-        st.session_state[_AUTO_NOTICE_KEY] = {
-            "error": "the grammar engine did not start (no Java, and the public "
-            "LanguageTool service could not be reached)."
-        }
-        return
-    try:
-        matches, corrected = _check_text(original)
-    except Exception as exc:
-        st.session_state[_AUTO_NOTICE_KEY] = {"error": str(exc)}
-        return
-    if not matches or corrected == original:
-        return
-    st.session_state[key] = corrected
-    st.session_state[_AUTO_NOTICE_KEY] = {
-        "field": field_name,
-        "original": original,
-        "corrected": corrected,
-        "count": len(matches),
-    }
+    if st.session_state.get(AUTO_GRAMMAR_KEY):
+        clean_fields([field_name], join_wrapped=False, grammar=True, label=_field_label(field_name))
+
+
+def _clean_all_fields() -> None:
+    clean_fields(_TEXT_FIELDS, join_wrapped=True, grammar=True, label="Clean up all fields")
 
 
 def _undo_auto_correct() -> None:
-    notice = st.session_state.pop(_AUTO_NOTICE_KEY, None)
-    # Only undo if the box still holds what auto-correct wrote.
-    if notice and "field" in notice:
-        key = editor_key(notice["field"])
-        if st.session_state.get(key) == notice["corrected"]:
-            st.session_state[key] = notice["original"]
+    notice = st.session_state.pop(_AUTO_NOTICE_KEY, None) or {}
+    for field_name, (old, new) in notice.get("changes", {}).items():
+        # Only undo boxes that still hold what the clean-up wrote.
+        if _current_text(field_name) == new:
+            _set_text(field_name, old)
     clear_generated_pdfs()
 
 
@@ -219,14 +277,20 @@ def render_auto_correct_notice() -> None:
     notice = st.session_state.get(_AUTO_NOTICE_KEY)
     if not notice:
         return
-    if "error" in notice:
-        st.warning(f"Auto-correct could not run: {notice['error']}")
+    if notice.get("warning"):
+        st.warning(notice["warning"])
+    changes = notice.get("changes", {})
+    if not changes:
         st.session_state.pop(_AUTO_NOTICE_KEY, None)
         return
-    label = _GRAMMAR_LABELS.get(notice["field"], notice["field"])
+    labels = ", ".join(_field_label(name) for name in changes)
+    grammar = notice.get("grammar_fixes", 0)
+    grammar_text = f", including **{grammar}** grammar fix(es)" if grammar else ""
     col_msg, col_undo, col_ok = st.columns([6, 1, 1])
     with col_msg:
-        st.success(f"✨ Auto-corrected **{notice['count']}** issue(s) in **{label}**.")
+        st.success(
+            f"✨ **{notice['label']}:** corrected {len(changes)} field(s){grammar_text} — {labels}."
+        )
     with col_undo:
         st.button("↩️ Undo", key="_auto_grammar_undo", on_click=_undo_auto_correct,
                   use_container_width=True)
@@ -369,7 +433,7 @@ def apply_extracted_fields(extracted: dict[str, Any]) -> None:
 
 def text_input(label: str, field_name: str, **kwargs: Any) -> str:
     key = _prepare_editor_widget(field_name)
-    return st.text_input(label, key=key, on_change=clear_generated_pdfs, **kwargs)
+    return st.text_input(label, key=key, on_change=_on_editor_change, args=(field_name,), **kwargs)
 
 
 def text_area(label: str, field_name: str, **kwargs: Any) -> str:
@@ -637,6 +701,12 @@ with st.sidebar:
             st.session_state["draft_import_message"] = ("error", str(exc))
         else:
             apply_extracted_fields(loaded)
+            if st.session_state.get(AUTO_GRAMMAR_KEY):
+                with st.spinner("Correcting the draft…"):
+                    clean_fields(
+                        [f for f in loaded if f in _TEXT_FIELDS],
+                        join_wrapped=True, grammar=True, label="Loaded draft",
+                    )
             st.session_state["draft_import_message"] = (
                 "success",
                 f"Draft loaded: {len(loaded)} field(s) restored.",
@@ -653,7 +723,8 @@ with st.sidebar:
         "Upload an existing syllabus PDF to auto-fill the fields. "
         "Unit-based and Project/Internship weekly-plan syllabi fill the Theory "
         "page; lab syllabi are detected automatically and fill the Lab page. "
-        "Review the extracted values before generating."
+        "Broken lines, extra spaces and numbering are fixed automatically "
+        "(grammar too, when Auto-correct is on). Review the values before generating."
     )
     uploaded_pdf = st.file_uploader("Upload syllabus PDF", type=["pdf"], key="pdf_import")
     if uploaded_pdf is not None and st.session_state.get("pdf_import_file_id") != uploaded_pdf.file_id:
@@ -666,6 +737,13 @@ with st.sidebar:
         else:
             if extracted:
                 apply_extracted_fields(extracted)
+                with st.spinner("Correcting the imported text…"):
+                    clean_fields(
+                        [f for f in extracted if f in _TEXT_FIELDS],
+                        join_wrapped=True,
+                        grammar=bool(st.session_state.get(AUTO_GRAMMAR_KEY)),
+                        label="PDF import",
+                    )
                 st.session_state["pdf_import_summary"] = sorted(extracted.keys())
                 st.rerun()
             else:
@@ -680,23 +758,20 @@ with st.sidebar:
         )
 
     st.divider()
-    st.subheader("Grammar")
-    if _GRAMMAR_AVAILABLE:
-        st.toggle(
-            "Auto-correct grammar",
-            key=AUTO_GRAMMAR_KEY,
-            help="When on, a text box is checked and corrected as soon as you finish "
-            "editing it (click outside or press Ctrl/Cmd+Enter). An Undo button "
-            "appears after each change. Text and Reference Books are never "
-            "auto-corrected, because author names are often flagged wrongly.",
-        )
-        if st.session_state.get(AUTO_GRAMMAR_KEY):
-            st.caption(
-                "Applies to new edits only. To fix text already in the boxes "
-                "(e.g. from a PDF import), use **Grammar Check & Fix** on the page."
-            )
-    else:
-        st.caption("Grammar tools are unavailable (`language_tool_python` not installed).")
+    st.subheader("Auto-correct")
+    st.toggle(
+        "Auto-correct (grammar, lines & spaces)",
+        key=AUTO_GRAMMAR_KEY,
+        help="When on: every box is corrected as soon as you finish editing it, and "
+        "imported PDFs and loaded drafts are corrected too. Fixes extra spaces, "
+        "spaces around commas/brackets, broken lines, typed numbering (1., CO1:, •), "
+        "unit headings (Unit 3 - x → UNIT III: X) and, for text boxes, grammar. "
+        "Text and Reference Books get spacing fixes only (author names are often "
+        "flagged as spelling errors). Every change has an Undo button.",
+    )
+    if not _GRAMMAR_AVAILABLE:
+        st.caption("Grammar engine not installed: only lines and spaces will be fixed.")
+    st.caption("To fix text already in the boxes, use **✨ Clean up all fields** on the page.")
 
     st.divider()
     current_page = st.radio(
@@ -710,6 +785,13 @@ st.info(
     "anywhere outside the box, or press a button such as Generate. In multi-line "
     "boxes you can also press Ctrl/Cmd+Enter to save without leaving the box.",
     icon="💾",
+)
+st.button(
+    "✨ Clean up all fields (grammar, lines & spaces)",
+    key="_clean_all_fields",
+    on_click=_clean_all_fields,
+    help="Fixes every field on both pages, including text from old PDF imports and "
+    "drafts. Book lists get spacing fixes only. You can Undo.",
 )
 render_auto_correct_notice()
 
