@@ -122,6 +122,21 @@ def _capitalize_body_line(line: str) -> str:
     return line
 
 
+def tidy_title(text: str) -> str:
+    """One-line title: spacing fixes and a capital first letter."""
+    line = tidy_line(text)
+    return line[:1].upper() + line[1:]
+
+
+def tidy_unit_body(text: str, *, join_wrapped: bool = False) -> str:
+    """Body of one unit: spacing fixes, no blank lines, capital line starts."""
+    lines = [tidy_line(line) for line in text.replace("\r\n", "\n").split("\n")]
+    lines = [line for line in lines if line]
+    if join_wrapped:
+        lines = _join_wrapped(lines)
+    return "\n".join(_capitalize_body_line(line) for line in lines)
+
+
 def tidy_units(text: str, *, join_wrapped: bool = False) -> str:
     """Tidy each unit; start a new unit at every 'UNIT ...' line, even
     if the blank line before it was forgotten."""

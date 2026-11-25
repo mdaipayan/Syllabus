@@ -4,6 +4,7 @@ import re
 from dataclasses import fields
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from draft_io import (
@@ -15,7 +16,23 @@ from draft_io import (
 )
 from pdf_extractor import PdfExtractionError, extract_syllabus_fields
 from syllabus_generator import SyllabusData, compile_pdf, render_lab_latex, render_theory_latex
-from text_cleanup import clean_field_text
+from structured_fields import (
+    HEADING_STYLES,
+    MAX_BOOKS,
+    NUMBER_FIELDS,
+    NUMBER_MAX,
+    NUMBER_STEP,
+    book_needs_check,
+    compose_heading,
+    detect_heading_style,
+    format_book,
+    format_number,
+    panel_title,
+    parse_book,
+    parse_number,
+    split_heading,
+)
+from text_cleanup import clean_field_text, tidy_title, tidy_unit_body, tidy_units
 
 try:
     import language_tool_python
@@ -152,9 +169,8 @@ def _apply_grammar_fixes(page_name: str, field_names: list[str]) -> None:
         result = results.pop(field_name, None)
         if result is None:
             continue
-        key = editor_key(field_name)
-        if st.session_state.get(key) == result["original"]:
-            st.session_state[key] = result["corrected"]
+        if _current_text(field_name) == result["original"]:
+            _set_text(field_name, result["corrected"])
         else:
             skipped.append(_GRAMMAR_LABELS.get(field_name, field_name))
     st.session_state[f"_grammar_skipped_{page_name}"] = skipped
@@ -172,7 +188,9 @@ _AUTO_GRAMMAR_FIELDS = {
 }
 # Every field edited as text (everything except the checkboxes).
 _TEXT_FIELDS = [
-    f.name for f in fields(SyllabusData) if not isinstance(getattr(SyllabusData(), f.name), bool)
+    f.name
+    for f in fields(SyllabusData)
+    if not isinstance(getattr(SyllabusData(), f.name), bool) and f.name not in NUMBER_FIELDS
 ]
 
 
@@ -181,24 +199,28 @@ def _field_label(field_name: str) -> str:
 
 
 def _current_text(field_name: str) -> str:
-    """Latest text of a field.
+    """Latest text of a field, in the editor's text form.
 
-    Inside a button/edit callback, boxes drawn in the last run hold the
+    Inside a button/edit callback, editors drawn in the last run hold the
     newest text. Otherwise the master copy in `data` is up to date.
     """
-    key = editor_key(field_name)
-    if field_name in st.session_state.get(_RENDERED_NOW_KEY, set()) and key in st.session_state:
-        return str(st.session_state[key])
+    if field_name in st.session_state.get(_RENDERED_NOW_KEY, set()):
+        value = _read_widget(field_name)
+        if value is not _MISSING:
+            return str(value)
     return str(widget_value_from_data(st.session_state.data, field_name))
 
 
 def _set_text(field_name: str, text: str) -> None:
-    """Write a field to both the master copy and its box.
+    """Write a field to both the master copy and its editor.
 
-    Only call from a callback or before the box is drawn in this run.
+    Only call from a callback or before the editor is drawn in this run.
     """
     setattr(st.session_state.data, field_name, data_value_from_widget(field_name, text))
-    st.session_state[editor_key(field_name)] = text
+    if field_name == UNIT_FIELD or field_name in BOOK_FIELDS:
+        _refresh_widget(field_name)  # panels/tables are rebuilt from the data
+    else:
+        st.session_state[editor_key(field_name)] = text  # keep the exact text
 
 
 def _clean_one(field_name: str, text: str, *, join_wrapped: bool, grammar: bool) -> tuple[str, int]:
@@ -293,9 +315,9 @@ def render_auto_correct_notice() -> None:
         )
     with col_undo:
         st.button("↩️ Undo", key="_auto_grammar_undo", on_click=_undo_auto_correct,
-                  use_container_width=True)
+                  width="stretch")
     with col_ok:
-        st.button("OK", key="_auto_grammar_ok", use_container_width=True,
+        st.button("OK", key="_auto_grammar_ok", width="stretch",
                   on_click=lambda: st.session_state.pop(_AUTO_NOTICE_KEY, None))
 
 
@@ -337,6 +359,9 @@ def block_from_units(units: list[tuple[str, str]]) -> str:
 
 def widget_value_from_data(data: SyllabusData, field_name: str) -> Any:
     value = getattr(data, field_name)
+    if field_name in NUMBER_FIELDS:
+        number = parse_number(value)
+        return float(number) if number is not None else 0.0
     if field_name in TEXT_LIST_FIELDS:
         return "\n".join(value)
     if field_name == UNIT_FIELD:
@@ -345,6 +370,9 @@ def widget_value_from_data(data: SyllabusData, field_name: str) -> Any:
 
 
 def data_value_from_widget(field_name: str, value: Any) -> Any:
+    if field_name in NUMBER_FIELDS:
+        number = value if isinstance(value, (int, float)) else parse_number(str(value))
+        return format_number(NUMBER_FIELDS[field_name], float(number or 0))
     if field_name in TEXT_LIST_FIELDS:
         return split_lines(str(value))
     if field_name == UNIT_FIELD:
@@ -373,17 +401,44 @@ def start_editor_run(data: SyllabusData) -> None:
     st.session_state[_RENDERED_PREV_KEY] = previous
     st.session_state[_RENDERED_NOW_KEY] = set()
     for field_name in previous:
-        key = editor_key(field_name)
-        if key in st.session_state:
-            setattr(data, field_name, data_value_from_widget(field_name, st.session_state[key]))
+        value = _read_widget(field_name)
+        if value is not _MISSING:
+            setattr(data, field_name, data_value_from_widget(field_name, value))
 
 
 def sync_data_from_editor_state(data: SyllabusData) -> None:
-    """Copy values of boxes drawn so far in this run into the dataclass."""
+    """Copy values of editors drawn so far in this run into the dataclass."""
     for field_name in st.session_state.get(_RENDERED_NOW_KEY, ()):
-        key = editor_key(field_name)
-        if key in st.session_state:
-            setattr(data, field_name, data_value_from_widget(field_name, st.session_state[key]))
+        value = _read_widget(field_name)
+        if value is not _MISSING:
+            setattr(data, field_name, data_value_from_widget(field_name, value))
+
+
+_MISSING = object()
+
+
+def _read_widget(field_name: str) -> Any:
+    """Fresh value of a field's editor, in the editor's form, or _MISSING."""
+    if field_name == UNIT_FIELD:
+        units = _read_units_panel()
+        return _MISSING if units is None else block_from_units(units)
+    if field_name in BOOK_FIELDS:
+        books = _read_books(field_name)
+        return _MISSING if books is None else "\n".join(books)
+    key = editor_key(field_name)
+    return st.session_state[key] if key in st.session_state else _MISSING
+
+
+def _refresh_widget(field_name: str) -> None:
+    """Load a field's editor from `data` (callbacks / before drawing only)."""
+    if field_name == UNIT_FIELD:
+        _reset_units_panel()
+    elif field_name in BOOK_FIELDS:
+        _reset_books(field_name)
+    else:
+        st.session_state[editor_key(field_name)] = widget_value_from_data(
+            st.session_state.data, field_name
+        )
 
 
 def _prepare_editor_widget(field_name: str) -> str:
@@ -411,12 +466,13 @@ def reset_editor_state() -> None:
     st.session_state.data = default_data()
     clear_generated_pdfs()
     for field_name in syllabus_field_names():
-        st.session_state.pop(editor_key(field_name), None)
+        _refresh_widget(field_name)
     # Clear the uploader widget too, otherwise its retained file would be
     # re-extracted on the next rerun and immediately undo the reset.
     st.session_state.pop("pdf_import", None)
     st.session_state.pop("pdf_import_file_id", None)
     st.session_state.pop("pdf_import_summary", None)
+    st.session_state.pop("pdf_import_number_warning", None)
     st.session_state.pop("draft_import", None)
     st.session_state.pop("draft_import_file_id", None)
     st.session_state.pop("draft_import_message", None)
@@ -427,8 +483,17 @@ def apply_extracted_fields(extracted: dict[str, Any]) -> None:
     data: SyllabusData = st.session_state.data
     for field_name, value in extracted.items():
         setattr(data, field_name, value)
-        st.session_state[editor_key(field_name)] = widget_value_from_data(data, field_name)
+        _refresh_widget(field_name)
     clear_generated_pdfs()
+
+
+def unreadable_numbers(extracted: dict[str, Any]) -> list[str]:
+    """Number fields whose imported text has no number in it (e.g. 'NA')."""
+    return [
+        f"{_field_label(name)} ('{value}')"
+        for name, value in extracted.items()
+        if name in NUMBER_FIELDS and str(value).strip() and parse_number(str(value)) is None
+    ]
 
 
 def text_input(label: str, field_name: str, **kwargs: Any) -> str:
@@ -452,23 +517,417 @@ def checkbox(label: str, field_name: str, **kwargs: Any) -> bool:
     return st.checkbox(label, key=key, on_change=clear_generated_pdfs, **kwargs)
 
 
-# "UNIT III: Title" for theory syllabi; "Phase I: ..." for Project/Internship weekly plans.
-_UNIT_HEADING_RE = re.compile(r"^(?:UNIT\s+[IVXL]+\s*:|PHASE\b)", re.IGNORECASE)
-MAX_BOOKS = 3
+# ---------------------------------------------------------------------------
+# Units editor: one panel per unit
+# ---------------------------------------------------------------------------
+_UNIT_IDS_KEY = "_unit_ids"
+_UNIT_NEXT_ID_KEY = "_unit_next_id"
+_UNIT_STYLE_KEY = "unit_heading_style"
+_UNIT_STYLE_LAST_KEY = "_unit_heading_style_last"
+_UNIT_DELETED_KEY = "_unit_last_deleted"
+_UNIT_PASTE_KEY = "_units_paste"
+_STYLE_LABELS = {"UNIT": "UNIT I, UNIT II, …", "Phase": "Phase I, Phase II, …", "Custom": "My own headings"}
+
+
+def _unit_keys(uid: int) -> tuple[str, str]:
+    return f"unit_title__{uid}", f"unit_body__{uid}"
+
+
+def _new_unit_id() -> int:
+    uid = st.session_state.get(_UNIT_NEXT_ID_KEY, 0)
+    st.session_state[_UNIT_NEXT_ID_KEY] = uid + 1
+    return uid
+
+
+def _clean_body_lines(body: str) -> str:
+    """Drop blank lines (they would split a unit in the text form)."""
+    return "\n".join(line.rstrip() for line in str(body).splitlines() if line.strip())
+
+
+def _units_panel_ready() -> bool:
+    ids = st.session_state.get(_UNIT_IDS_KEY)
+    if ids is None or _UNIT_STYLE_KEY not in st.session_state:
+        return False
+    return all(key in st.session_state for uid in ids for key in _unit_keys(uid))
+
+
+def _read_units_panel() -> list[tuple[str, str]] | None:
+    """Units as (heading, body) from the panels, or None if not available."""
+    if not _units_panel_ready():
+        return None
+    style = st.session_state[_UNIT_STYLE_KEY]
+    units = []
+    for position, uid in enumerate(st.session_state[_UNIT_IDS_KEY], start=1):
+        title_key, body_key = _unit_keys(uid)
+        heading = compose_heading(style, position, str(st.session_state[title_key]))
+        units.append((heading, _clean_body_lines(st.session_state[body_key])))
+    return units
+
+
+def _reset_units_panel() -> None:
+    """Rebuild all panels from data.units with fresh widget keys."""
+    for uid in st.session_state.get(_UNIT_IDS_KEY, []):
+        for key in _unit_keys(uid):
+            st.session_state.pop(key, None)
+    units = st.session_state.data.units
+    style = detect_heading_style(units)
+    st.session_state[_UNIT_STYLE_KEY] = style
+    st.session_state[_UNIT_STYLE_LAST_KEY] = style
+    ids = []
+    for heading, body in units:
+        uid = _new_unit_id()
+        title_key, body_key = _unit_keys(uid)
+        st.session_state[title_key] = panel_title(style, heading)
+        st.session_state[body_key] = body
+        ids.append(uid)
+    st.session_state[_UNIT_IDS_KEY] = ids
+
+
+def _units_changed() -> None:
+    """After a panel action: copy panels into data, drop generated PDFs."""
+    units = _read_units_panel()
+    if units is not None:
+        st.session_state.data.units = units
+    clear_generated_pdfs()
+
+
+def _move_unit(uid: int, step: int) -> None:
+    ids = st.session_state[_UNIT_IDS_KEY]
+    i = ids.index(uid)
+    j = i + step
+    if 0 <= j < len(ids):
+        ids[i], ids[j] = ids[j], ids[i]
+    _units_changed()
+
+
+def _delete_unit(uid: int) -> None:
+    ids = st.session_state[_UNIT_IDS_KEY]
+    title_key, body_key = _unit_keys(uid)
+    st.session_state[_UNIT_DELETED_KEY] = {
+        "position": ids.index(uid),
+        "title": st.session_state.pop(title_key, ""),
+        "body": st.session_state.pop(body_key, ""),
+    }
+    ids.remove(uid)
+    _units_changed()
+
+
+def _restore_unit() -> None:
+    deleted = st.session_state.pop(_UNIT_DELETED_KEY, None)
+    if not deleted:
+        return
+    uid = _new_unit_id()
+    title_key, body_key = _unit_keys(uid)
+    st.session_state[title_key] = deleted["title"]
+    st.session_state[body_key] = deleted["body"]
+    ids = st.session_state[_UNIT_IDS_KEY]
+    ids.insert(min(deleted["position"], len(ids)), uid)
+    _units_changed()
+
+
+def _add_unit() -> None:
+    uid = _new_unit_id()
+    title_key, body_key = _unit_keys(uid)
+    st.session_state[title_key] = ""
+    st.session_state[body_key] = ""
+    st.session_state[_UNIT_IDS_KEY].append(uid)
+    _units_changed()
+
+
+def _on_unit_style_change() -> None:
+    """Keep headings meaningful when switching UNIT / Phase / own headings."""
+    old = st.session_state.get(_UNIT_STYLE_LAST_KEY, "UNIT")
+    new = st.session_state[_UNIT_STYLE_KEY]
+    for position, uid in enumerate(st.session_state.get(_UNIT_IDS_KEY, []), start=1):
+        title_key, _ = _unit_keys(uid)
+        title = str(st.session_state.get(title_key, ""))
+        if new == "Custom" and old != "Custom":
+            st.session_state[title_key] = compose_heading(old, position, title)
+        elif new != "Custom":
+            # Drop any "UNIT I:" / "Phase I:" prefix; the new one is added automatically.
+            found, bare = split_heading(title)
+            st.session_state[title_key] = bare if found != "Custom" else title
+    st.session_state[_UNIT_STYLE_LAST_KEY] = new
+    _units_changed()
+
+
+def _on_unit_edit(uid: int) -> None:
+    """A unit's title or contents changed; auto-correct just that unit.
+
+    Only this unit's boxes are rewritten, so typing in other units is never
+    disturbed. Undo brings back exactly what the user typed.
+    """
+    _units_changed()
+    typed_block = _current_text(UNIT_FIELD)  # panels hold the raw edit here
+    if not st.session_state.get(AUTO_GRAMMAR_KEY):
+        return
+    title_key, body_key = _unit_keys(uid)
+    title = tidy_title(str(st.session_state.get(title_key, "")))
+    body = tidy_unit_body(str(st.session_state.get(body_key, "")))
+    fixes = 0
+    warning = None
+    if body:
+        if _load_grammar_tool() is None:
+            warning = ("Grammar was skipped: the grammar engine did not start. "
+                       "Lines and spaces were still fixed.")
+        else:
+            try:
+                matches, corrected = _check_text(body)
+                if matches:
+                    body, fixes = tidy_unit_body(corrected), len(matches)
+            except Exception as exc:
+                warning = f"Grammar check failed: {exc}"
+    if title != st.session_state.get(title_key):
+        st.session_state[title_key] = title
+    if body != _clean_body_lines(st.session_state.get(body_key, "")):
+        st.session_state[body_key] = body
+    _units_changed()
+    new_block = _current_text(UNIT_FIELD)
+    notice: dict[str, Any] = {"label": "Units", "changes": {}, "grammar_fixes": fixes}
+    if new_block != typed_block:
+        notice["changes"][UNIT_FIELD] = (typed_block, new_block)
+    if warning:
+        notice["warning"] = warning
+    if notice["changes"] or warning:
+        st.session_state[_AUTO_NOTICE_KEY] = notice
+
+
+def _apply_units_paste() -> None:
+    text = str(st.session_state.get(_UNIT_PASTE_KEY, "")).strip()
+    if not text:
+        st.session_state[_AUTO_NOTICE_KEY] = {
+            "label": "Paste all units", "changes": {}, "warning": "The paste box is empty.",
+        }
+        return
+    old_block = _current_text(UNIT_FIELD)
+    new_block = tidy_units(text, join_wrapped=True)
+    _set_text(UNIT_FIELD, new_block)
+    st.session_state[_UNIT_PASTE_KEY] = ""
+    st.session_state[_AUTO_NOTICE_KEY] = {
+        "label": "Paste all units",
+        "changes": {UNIT_FIELD: (old_block, _current_text(UNIT_FIELD))},
+        "grammar_fixes": 0,
+    }
+    clear_generated_pdfs()
+
+
+def render_units_editor() -> None:
+    previous = st.session_state.get(_RENDERED_PREV_KEY, set())
+    if UNIT_FIELD not in previous or not _units_panel_ready():
+        _reset_units_panel()
+    st.session_state[_RENDERED_NOW_KEY].add(UNIT_FIELD)
+
+    st.markdown("**Units**")
+    st.radio(
+        "Heading style",
+        HEADING_STYLES,
+        key=_UNIT_STYLE_KEY,
+        horizontal=True,
+        format_func=_STYLE_LABELS.get,
+        on_change=_on_unit_style_change,
+        help="UNIT/Phase numbers are added automatically. Choose 'My own headings' "
+        "to type each heading in full.",
+    )
+    style = st.session_state[_UNIT_STYLE_KEY]
+    ids = list(st.session_state[_UNIT_IDS_KEY])
+    for position, uid in enumerate(ids, start=1):
+        title_key, body_key = _unit_keys(uid)
+        with st.container(border=True):
+            c_label, c_title, c_up, c_down, c_del = st.columns([1.3, 7, 0.6, 0.6, 0.6])
+            with c_label:
+                label = compose_heading(style, position, "").rstrip(":") if style != "Custom" else f"#{position}"
+                st.markdown(f"**{label}**")
+            with c_title:
+                st.text_input(
+                    "Title",
+                    key=title_key,
+                    label_visibility="collapsed",
+                    placeholder="Full heading" if style == "Custom" else "Unit title, e.g. Fluid Dynamics",
+                    on_change=_on_unit_edit,
+                    args=(uid,),
+                )
+            with c_up:
+                st.button("↑", key=f"unit_up__{uid}", on_click=_move_unit, args=(uid, -1),
+                          disabled=position == 1, help="Move up", width="stretch")
+            with c_down:
+                st.button("↓", key=f"unit_down__{uid}", on_click=_move_unit, args=(uid, 1),
+                          disabled=position == len(ids), help="Move down", width="stretch")
+            with c_del:
+                st.button("🗑", key=f"unit_del__{uid}", on_click=_delete_unit, args=(uid,),
+                          help="Delete this unit (you can restore it)", width="stretch")
+            st.text_area(
+                "Contents",
+                key=body_key,
+                label_visibility="collapsed",
+                height=110,
+                placeholder="Contents of this unit",
+                on_change=_on_unit_edit,
+                args=(uid,),
+            )
+
+    col_add, col_restore = st.columns([1, 1])
+    with col_add:
+        st.button("➕ Add unit", key="unit_add", on_click=_add_unit, width="stretch")
+    with col_restore:
+        deleted = st.session_state.get(_UNIT_DELETED_KEY)
+        if deleted:
+            name = deleted["title"] or "the deleted unit"
+            st.button(f"↩️ Restore {name}"[:60], key="unit_restore", on_click=_restore_unit,
+                      width="stretch")
+
+    with st.expander("📋 Paste all units at once (from Word or an old syllabus)"):
+        st.caption(
+            "Paste every unit here and click the button: the text is split into "
+            "panels automatically. Lines starting with 'Unit 1', 'UNIT II:' etc. "
+            "start a new unit. This replaces the current units (you can Undo)."
+        )
+        st.text_area("Paste units", key=_UNIT_PASTE_KEY, height=200, label_visibility="collapsed",
+                     placeholder="UNIT I: Introduction\nProperties of fluids…\n\nUNIT II: Fluid Kinematics\n…")
+        st.button("Replace units with pasted text", key="unit_paste_apply", on_click=_apply_units_paste)
+
+
+# ---------------------------------------------------------------------------
+# Books editor: 3-row table
+# ---------------------------------------------------------------------------
+BOOK_FIELDS = ("textbooks", "reference_books")
+_BOOK_COLUMNS = ("Author(s)", "Book title", "Publisher")
+
+
+def _books_version_key(field_name: str) -> str:
+    return f"_books_version__{field_name}"
+
+
+def _books_widget_key(field_name: str) -> str:
+    return f"books__{field_name}__{st.session_state.get(_books_version_key(field_name), 0)}"
+
+
+def _books_base_key(field_name: str) -> str:
+    return f"_books_base__{field_name}"
+
+
+def _books_check_key(field_name: str) -> str:
+    return f"_books_check__{field_name}"
+
+
+def _reset_books(field_name: str) -> None:
+    """Rebuild a book table from data with a fresh widget key."""
+    st.session_state.pop(_books_widget_key(field_name), None)
+    st.session_state[_books_version_key(field_name)] = (
+        st.session_state.get(_books_version_key(field_name), 0) + 1
+    )
+    lines = list(getattr(st.session_state.data, field_name))
+    rows = [dict(zip(_BOOK_COLUMNS, parse_book(line))) for line in lines]
+    while len(rows) < MAX_BOOKS:
+        rows.append(dict.fromkeys(_BOOK_COLUMNS, ""))
+    st.session_state[_books_base_key(field_name)] = rows
+    st.session_state[_books_check_key(field_name)] = {
+        index for index, line in enumerate(lines) if book_needs_check(line)
+    }
+
+
+def _book_rows(field_name: str) -> list[dict] | None:
+    """Table rows with the user's edits applied, or None if not available."""
+    base = st.session_state.get(_books_base_key(field_name))
+    if base is None:
+        return None
+    rows = [dict(row) for row in base]
+    state = st.session_state.get(_books_widget_key(field_name)) or {}
+    for index, changes in (state.get("edited_rows") or {}).items():
+        index = int(index)
+        if 0 <= index < len(rows):
+            rows[index].update({k: ("" if v is None else str(v)) for k, v in changes.items()})
+    return rows
+
+
+def _read_books(field_name: str) -> list[str] | None:
+    rows = _book_rows(field_name)
+    if rows is None:
+        return None
+    lines = [format_book(*(row.get(col, "") for col in _BOOK_COLUMNS)) for row in rows]
+    return [line for line in lines if line]
+
+
+def _on_books_change(field_name: str) -> None:
+    books = _read_books(field_name)
+    if books is not None:
+        setattr(st.session_state.data, field_name, books)
+    # A row the user has edited no longer needs the "please check" mark.
+    state = st.session_state.get(_books_widget_key(field_name)) or {}
+    edited = {int(i) for i in (state.get("edited_rows") or {})}
+    st.session_state[_books_check_key(field_name)] = (
+        st.session_state.get(_books_check_key(field_name), set()) - edited
+    )
+    clear_generated_pdfs()
+
+
+def render_books_editor(field_name: str, label: str) -> None:
+    previous = st.session_state.get(_RENDERED_PREV_KEY, set())
+    if field_name not in previous or _books_base_key(field_name) not in st.session_state:
+        _reset_books(field_name)
+    st.session_state[_RENDERED_NOW_KEY].add(field_name)
+
+    st.markdown(f"**{label}** (max {MAX_BOOKS})")
+    st.data_editor(
+        pd.DataFrame(st.session_state[_books_base_key(field_name)], columns=list(_BOOK_COLUMNS)),
+        key=_books_widget_key(field_name),
+        num_rows="fixed",
+        hide_index=True,
+        width="stretch",
+        on_change=_on_books_change,
+        args=(field_name,),
+        column_config={
+            "Author(s)": st.column_config.TextColumn(width="medium", help="e.g. Thomas H. Cormen"),
+            "Book title": st.column_config.TextColumn(width="large", help="e.g. Introduction to Algorithms"),
+            "Publisher": st.column_config.TextColumn(
+                width="small", help="e.g. PHI — 'Pub.' is added automatically"
+            ),
+        },
+    )
+    books = _read_books(field_name) or []
+    if books:
+        st.caption("In the PDF: " + " · ".join(f"{i}. {line}" for i, line in enumerate(books, 1)))
+    if len(getattr(st.session_state.data, field_name)) > MAX_BOOKS:
+        st.warning(f"More than {MAX_BOOKS} entries were imported; only {MAX_BOOKS} are allowed.")
+    to_check = sorted(st.session_state.get(_books_check_key(field_name), set()))
+    if to_check:
+        st.warning(
+            "Row(s) " + ", ".join(str(i + 1) for i in to_check) + " were split into columns "
+            "automatically from old text with extra commas. Please check that author, "
+            "title and publisher are in the right columns."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Number boxes: credits, hours, marks
+# ---------------------------------------------------------------------------
+_NUMBER_UNITS = {"credits": "", "count": "", "hours": " (hours)", "marks": " (marks)"}
+
+
+def number_input(label: str, field_name: str) -> float:
+    kind = NUMBER_FIELDS[field_name]
+    key = _prepare_editor_widget(field_name)
+    return st.number_input(
+        label + _NUMBER_UNITS[kind],
+        key=key,
+        min_value=0.0,
+        max_value=NUMBER_MAX[kind],
+        step=NUMBER_STEP[kind],
+        format="%g",
+        on_change=clear_generated_pdfs,
+        help=f"Shown in the PDF as '{format_number(kind, 3 if kind != 'marks' else 40)}'.",
+    )
+
+
+def render_marks_total(internal_field: str, end_field: str) -> None:
+    internal = float(st.session_state.get(editor_key(internal_field)) or 0)
+    end = float(st.session_state.get(editor_key(end_field)) or 0)
+    st.caption(f"Total marks: **{internal + end:g}** (internal {internal:g} + end semester {end:g})")
 
 
 def render_theory_warnings(data: SyllabusData) -> None:
-    """Soft checks for the formats the field labels ask for."""
-    bad_headings = [heading for heading, _ in data.units if not _UNIT_HEADING_RE.match(heading)]
-    if bad_headings:
-        st.warning(
-            "These unit headings do not follow the format `UNIT III: Title` "
-            "(or a blank line is missing between units): "
-            + "; ".join(f"`{h}`" for h in bad_headings)
-        )
-    for label, items in (("Text Books", data.textbooks), ("Reference Books", data.reference_books)):
-        if len(items) > MAX_BOOKS:
-            st.warning(f"{label}: {len(items)} entries found, maximum is {MAX_BOOKS}.")
+    """Soft checks that the structured editors cannot enforce themselves."""
+    if not data.units:
+        st.warning("There are no units. Click **➕ Add unit** or paste them.")
 
 
 def render_grammar_panel(page_name: str) -> None:
@@ -496,13 +955,13 @@ def render_grammar_panel(page_name: str) -> None:
                 "Check Grammar",
                 key=f"_grammar_run_{page_name}",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
         with col_clear:
             st.button(
                 "Clear Results",
                 key=f"_grammar_clear_{page_name}",
-                use_container_width=True,
+                width="stretch",
                 on_click=_clear_grammar_results,
                 args=(page_name,),
             )
@@ -522,7 +981,7 @@ def render_grammar_panel(page_name: str) -> None:
                 try:
                     with st.spinner("Checking grammar…"):
                         for field_name in fields_to_check:
-                            text = str(st.session_state.get(editor_key(field_name), ""))
+                            text = _current_text(field_name)
                             matches, corrected = _check_text(text)
                             if matches:
                                 results[field_name] = {
@@ -689,7 +1148,7 @@ with st.sidebar:
         file_name=draft_file_name(data),
         mime="application/json",
         key="draft_save",
-        use_container_width=True,
+        width="stretch",
         help="Downloads a small .json file with every field on both pages.",
     )
     uploaded_draft = st.file_uploader("Load draft (.json)", type=["json"], key="draft_import")
@@ -736,6 +1195,7 @@ with st.sidebar:
             st.error(str(exc))
         else:
             if extracted:
+                st.session_state["pdf_import_number_warning"] = unreadable_numbers(extracted)
                 apply_extracted_fields(extracted)
                 with st.spinner("Correcting the imported text…"):
                     clean_fields(
@@ -750,6 +1210,11 @@ with st.sidebar:
                 st.session_state.pop("pdf_import_summary", None)
                 st.warning("No recognisable syllabus fields were found in that PDF.")
 
+    if st.session_state.get("pdf_import_number_warning"):
+        st.warning(
+            "No number found for: " + ", ".join(st.session_state["pdf_import_number_warning"])
+            + ". Set these by hand."
+        )
     if st.session_state.get("pdf_import_summary"):
         filled = st.session_state["pdf_import_summary"]
         st.success(
@@ -798,40 +1263,27 @@ render_auto_correct_notice()
 if current_page == "Theory Page":
     st.subheader("Theory Details")
     text_input("Course Title", "title")
+    text_input("Subject Code", "subject_code")
     meta1, meta2 = st.columns(2)
     with meta1:
-        text_input("Total Credits", "total_credits")
-        text_input("Teaching Hours / Week", "teaching_hours")
-        text_input("Tutorial Hours / Week", "tutorial_hours")
-        text_input("Practical Hours / Week", "practical_hours")
+        number_input("Total Credits", "total_credits")
+        number_input("Teaching Hours / Week", "teaching_hours")
+        number_input("Tutorial Hours / Week", "tutorial_hours")
+        number_input("Practical Hours / Week", "practical_hours")
 
     with meta2:
-        text_input("Subject Code", "subject_code")
-        text_input("Exam Duration", "exam_duration")
-        text_input("Internal Evaluation", "internal_evaluation")
-        text_input("End Semester Evaluation", "end_semester_evaluation")
+        number_input("Exam Duration", "exam_duration")
+        number_input("Internal Evaluation", "internal_evaluation")
+        number_input("End Semester Evaluation", "end_semester_evaluation")
+        render_marks_total("internal_evaluation", "end_semester_evaluation")
 
-    text_area("Course Objectives", "objectives", height=140)
-    text_area("Course Outcomes", "outcomes", height=180)
-    text_area(
-        "Units (give one line space for new unit. "
-        ":red[Use this format only] :blue[UNIT III: Fluid Dynamics]:red[)]",
-        "units",
-        height=600,
-        help="Saved when you click outside the box or press Ctrl/Cmd+Enter.",
-    )
-    text_area(
-        "Text Books :red[(Max 3. Strictly follow the Sample:] "
-        ":blue[Thomas H. Cormen, Introduction to Algorithms, PHI Pub.]:red[)]",
-        "textbooks",
-        height=110,
-    )
-    text_area(
-        "Reference Books :red[(Max 3. Strictly follow the Sample:] "
-        ":blue[Parag Himanshu Dave, Balchandra Dave, Design and Analysis of Algorithms, Education, O'Reilly Pub.]:red[)]",
-        "reference_books",
-        height=110,
-    )
+    text_area("Course Objectives", "objectives", height=140,
+              help="One objective per line. Numbering is added in the PDF.")
+    text_area("Course Outcomes", "outcomes", height=180,
+              help="One outcome per line. CO1, CO2, … are added in the PDF.")
+    render_units_editor()
+    render_books_editor("textbooks", "Text Books")
+    render_books_editor("reference_books", "Reference Books")
 
     sync_data_from_editor_state(data)
     render_theory_warnings(data)
@@ -851,17 +1303,18 @@ else:
     st.caption("The Lab page is independent. It will not be added to the Theory PDF.")
     text_input("Lab Table Title", "lab_table_title")
     text_input("Lab Section Title", "lab_section_title")
+    text_input("Lab Subject Code", "lab_subject_code")
     lab1, lab2 = st.columns(2)
     with lab1:
-        text_input("Lab Credits", "lab_total_credits")
-        text_input("Lab Teaching Hours / Week", "lab_teaching_hours")
-        text_input("Lab Tutorial Hours / Week", "lab_tutorial_hours")
-        text_input("Lab Practical Hours / Week", "lab_practical_hours")
+        number_input("Lab Credits", "lab_total_credits")
+        number_input("Lab Teaching Hours / Week", "lab_teaching_hours")
+        number_input("Lab Tutorial Hours / Week", "lab_tutorial_hours")
+        number_input("Lab Practical Hours / Week", "lab_practical_hours")
     with lab2:
-        text_input("Lab Subject Code", "lab_subject_code")
-        text_input("Lab Exam Duration", "lab_exam_duration")
-        text_input("Lab Internal Evaluation", "lab_internal_evaluation")
-        text_input("Lab End Semester Evaluation", "lab_end_semester_evaluation")
+        number_input("Lab Exam Duration", "lab_exam_duration")
+        number_input("Lab Internal Evaluation", "lab_internal_evaluation")
+        number_input("Lab End Semester Evaluation", "lab_end_semester_evaluation")
+        render_marks_total("lab_internal_evaluation", "lab_end_semester_evaluation")
 
     text_area("Lab Objectives", "lab_objectives", height=140)
     text_area("Lab Outcomes", "lab_outcomes", height=180)
