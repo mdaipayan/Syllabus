@@ -6,7 +6,7 @@ A Streamlit app that lets users edit syllabus fields, generate a new LaTeX sylla
 
 - Upload an existing syllabus PDF to auto-fill the Theory fields (title, course details, objectives, outcomes, units, text/reference books); lab syllabi are detected automatically and fill the Lab fields.
 - Also recognises Project/Internship syllabi that use a phase-based "Weekly Work Plan" instead of units and carry no books (only the signatory box is added)
-- Edit Theory and Lab pages independently from the browser
+- Edit Theory and Lab pages independently from the browser — switch with the big **📘 Theory page / 🧪 Lab page** buttons at the top (plus Next/Back at the bottom)
 - Structured input: one panel per unit (UNIT/Phase numbers added automatically; add, delete, restore, move up/down; paste all units at once), a 3-row Author · Title · Publisher table for Text and Reference Books (`Pub.` added automatically), and number boxes for credits, hours and marks with a marks total
 - Auto-correct (sidebar switch) fixes grammar, extra spaces, spacing around punctuation, broken lines, typed numbering (`1.`, `CO1:`, `•`) and unit headings (`Unit 3 - x` → `UNIT III: X`) as you edit; **✨ Clean up all fields** does the same for everything already in the boxes, e.g. old PDF imports. Every change can be undone
 - Save your work as a small `.json` draft and load it later (the app does not keep work after a refresh or when Streamlit Cloud sleeps)
