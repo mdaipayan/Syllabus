@@ -153,6 +153,81 @@ def _apply_grammar_fixes(page_name: str, field_names: list[str]) -> None:
     clear_generated_pdfs()
 
 
+AUTO_GRAMMAR_KEY = "_auto_grammar_enabled"
+_AUTO_NOTICE_KEY = "_auto_grammar_notice"
+# Fields auto-correct may change: every grammar-checked field except book lists.
+_AUTO_GRAMMAR_FIELDS = {
+    name
+    for names in _GRAMMAR_FIELDS.values()
+    for name in names
+    if name not in _APPLY_ALL_EXCLUDED
+}
+
+
+def _on_editor_change(field_name: str) -> None:
+    """on_change callback for editor widgets.
+
+    Runs before the script redraws the widgets, so it may replace the text.
+    With auto-correct on, the edited field is grammar-checked and fixed
+    straight away, and the original is kept so the user can undo.
+    """
+    clear_generated_pdfs()
+    if not st.session_state.get(AUTO_GRAMMAR_KEY) or field_name not in _AUTO_GRAMMAR_FIELDS:
+        return
+    key = editor_key(field_name)
+    original = str(st.session_state.get(key, ""))
+    if _load_grammar_tool() is None:
+        st.session_state[_AUTO_NOTICE_KEY] = {
+            "error": "the grammar engine did not start (no Java, and the public "
+            "LanguageTool service could not be reached)."
+        }
+        return
+    try:
+        matches, corrected = _check_text(original)
+    except Exception as exc:
+        st.session_state[_AUTO_NOTICE_KEY] = {"error": str(exc)}
+        return
+    if not matches or corrected == original:
+        return
+    st.session_state[key] = corrected
+    st.session_state[_AUTO_NOTICE_KEY] = {
+        "field": field_name,
+        "original": original,
+        "corrected": corrected,
+        "count": len(matches),
+    }
+
+
+def _undo_auto_correct() -> None:
+    notice = st.session_state.pop(_AUTO_NOTICE_KEY, None)
+    # Only undo if the box still holds what auto-correct wrote.
+    if notice and "field" in notice:
+        key = editor_key(notice["field"])
+        if st.session_state.get(key) == notice["corrected"]:
+            st.session_state[key] = notice["original"]
+    clear_generated_pdfs()
+
+
+def render_auto_correct_notice() -> None:
+    notice = st.session_state.get(_AUTO_NOTICE_KEY)
+    if not notice:
+        return
+    if "error" in notice:
+        st.warning(f"Auto-correct could not run: {notice['error']}")
+        st.session_state.pop(_AUTO_NOTICE_KEY, None)
+        return
+    label = _GRAMMAR_LABELS.get(notice["field"], notice["field"])
+    col_msg, col_undo, col_ok = st.columns([6, 1, 1])
+    with col_msg:
+        st.success(f"✨ Auto-corrected **{notice['count']}** issue(s) in **{label}**.")
+    with col_undo:
+        st.button("↩️ Undo", key="_auto_grammar_undo", on_click=_undo_auto_correct,
+                  use_container_width=True)
+    with col_ok:
+        st.button("OK", key="_auto_grammar_ok", use_container_width=True,
+                  on_click=lambda: st.session_state.pop(_AUTO_NOTICE_KEY, None))
+
+
 def _clear_grammar_results(page_name: str) -> None:
     st.session_state.pop(_grammar_results_key(page_name), None)
     st.session_state.pop(f"_grammar_skipped_{page_name}", None)
@@ -271,7 +346,13 @@ def text_input(label: str, field_name: str, **kwargs: Any) -> str:
 
 
 def text_area(label: str, field_name: str, **kwargs: Any) -> str:
-    return st.text_area(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
+    return st.text_area(
+        label,
+        key=editor_key(field_name),
+        on_change=_on_editor_change,
+        args=(field_name,),
+        **kwargs,
+    )
 
 
 def checkbox(label: str, field_name: str, **kwargs: Any) -> bool:
@@ -535,6 +616,25 @@ with st.sidebar:
         )
 
     st.divider()
+    st.subheader("Grammar")
+    if _GRAMMAR_AVAILABLE:
+        st.toggle(
+            "Auto-correct grammar",
+            key=AUTO_GRAMMAR_KEY,
+            help="When on, a text box is checked and corrected as soon as you finish "
+            "editing it (click outside or press Ctrl/Cmd+Enter). An Undo button "
+            "appears after each change. Text and Reference Books are never "
+            "auto-corrected, because author names are often flagged wrongly.",
+        )
+        if st.session_state.get(AUTO_GRAMMAR_KEY):
+            st.caption(
+                "Applies to new edits only. To fix text already in the boxes "
+                "(e.g. from a PDF import), use **Grammar Check & Fix** on the page."
+            )
+    else:
+        st.caption("Grammar tools are unavailable (`language_tool_python` not installed).")
+
+    st.divider()
     current_page = st.radio(
         "Editor Pages",
         ["Theory Page", "Lab Page"],
@@ -547,6 +647,7 @@ st.info(
     "boxes you can also press Ctrl/Cmd+Enter to save without leaving the box.",
     icon="💾",
 )
+render_auto_correct_notice()
 
 if current_page == "Theory Page":
     st.subheader("Theory Details")
