@@ -6,6 +6,7 @@ from typing import Any
 
 import streamlit as st
 
+from draft_io import DraftError, draft_file_name, draft_from_json, draft_to_json
 from pdf_extractor import PdfExtractionError, extract_syllabus_fields
 from syllabus_generator import SyllabusData, compile_pdf, render_lab_latex, render_theory_latex
 
@@ -316,6 +317,9 @@ def reset_editor_state() -> None:
     st.session_state.pop("pdf_import", None)
     st.session_state.pop("pdf_import_file_id", None)
     st.session_state.pop("pdf_import_summary", None)
+    st.session_state.pop("draft_import", None)
+    st.session_state.pop("draft_import_file_id", None)
+    st.session_state.pop("draft_import_message", None)
 
 
 def apply_extracted_fields(extracted: dict[str, Any]) -> None:
@@ -582,6 +586,40 @@ with st.sidebar:
     if st.button("Reset to default"):
         reset_editor_state()
         st.rerun()
+
+    st.divider()
+    st.subheader("Save / Load Draft")
+    st.caption(
+        "Your work is **lost** if the page is refreshed or the app goes to sleep. "
+        "Click **Save draft** often; later, load the file to continue where you stopped."
+    )
+    st.download_button(
+        "💾 Save draft",
+        data=draft_to_json(data),
+        file_name=draft_file_name(data),
+        mime="application/json",
+        key="draft_save",
+        use_container_width=True,
+        help="Downloads a small .json file with every field on both pages.",
+    )
+    uploaded_draft = st.file_uploader("Load draft (.json)", type=["json"], key="draft_import")
+    if uploaded_draft is not None and st.session_state.get("draft_import_file_id") != uploaded_draft.file_id:
+        st.session_state["draft_import_file_id"] = uploaded_draft.file_id
+        try:
+            loaded = draft_from_json(uploaded_draft.getvalue())
+        except DraftError as exc:
+            st.session_state["draft_import_message"] = ("error", str(exc))
+        else:
+            apply_extracted_fields(loaded)
+            st.session_state["draft_import_message"] = (
+                "success",
+                f"Draft loaded: {len(loaded)} field(s) restored.",
+            )
+            st.rerun()
+    draft_message = st.session_state.get("draft_import_message")
+    if draft_message:
+        kind, text = draft_message
+        (st.success if kind == "success" else st.error)(text)
 
     st.divider()
     st.subheader("Import from PDF")
