@@ -50,14 +50,47 @@ _GRAMMAR_LABELS: dict[str, str] = {
 }
 
 
+# LanguageTool rules that misfire on line-based syllabus text (each list item
+# is one line without a full stop, headings are all caps, etc.).
+_IGNORED_GRAMMAR_RULES = {
+    "UPPERCASE_SENTENCE_START",
+    "WHITESPACE_RULE",
+    "CONSECUTIVE_SPACES",
+    "PUNCTUATION_PARAGRAPH_END",
+}
+# Author names and publishers are flagged as spelling errors, so book lists are
+# never changed by "Apply All"; they can still be fixed one field at a time.
+_APPLY_ALL_EXCLUDED = {"textbooks", "reference_books"}
+
+
 @st.cache_resource(show_spinner="Loading grammar engine… (first run may take a minute)")
+def _load_grammar_tool_cached() -> "language_tool_python.LanguageTool":
+    """Start the local engine (needs Java); fall back to the public LanguageTool API.
+
+    Raises if both fail. Exceptions are not cached by st.cache_resource, so a
+    later click retries instead of staying broken until the app restarts.
+    """
+    try:
+        return language_tool_python.LanguageTool("en-US")
+    except Exception:
+        return language_tool_python.LanguageToolPublicAPI("en-US")
+
+
 def _load_grammar_tool() -> "language_tool_python.LanguageTool | None":
     if not _GRAMMAR_AVAILABLE:
         return None
     try:
-        return language_tool_python.LanguageTool("en-US")
+        return _load_grammar_tool_cached()
     except Exception:
         return None
+
+
+def _attr(obj: Any, *names: str, default: Any = None) -> Any:
+    """Read the first attribute that exists; names differ across language_tool_python versions."""
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
 
 
 def _check_text(text: str) -> tuple[list[dict], str]:
@@ -65,22 +98,64 @@ def _check_text(text: str) -> tuple[list[dict], str]:
     tool = _load_grammar_tool()
     if tool is None or not text.strip():
         return [], text
-    matches = tool.check(text)
+    matches = [
+        m for m in tool.check(text)
+        if _attr(m, "ruleId", "rule_id", default="") not in _IGNORED_GRAMMAR_RULES
+    ]
     if not matches:
         return [], text
     corrected = language_tool_python.utils.correct(text, matches)
     info = [
         {
-            "message": m.message,
-            "context": m.context,
-            "offset": getattr(m, "offset", getattr(m, "errorOffset", 0)),
-            "length": getattr(m, "errorLength", getattr(m, "error_length", getattr(m, "length", 0))),
-            "replacements": m.replacements[:4],
-            "rule": m.ruleId,
+            "message": _attr(m, "message", default=""),
+            "context": _attr(m, "context", default=""),
+            "context_offset": _attr(m, "offsetInContext", "offset_in_context", default=None),
+            "length": _attr(m, "errorLength", "error_length", "length", default=0),
+            "replacements": list(_attr(m, "replacements", default=[]))[:4],
+            "rule": _attr(m, "ruleId", "rule_id", default=""),
         }
         for m in matches
     ]
     return info, corrected
+
+
+def _context_with_marker(match: dict) -> str:
+    """Return the context line plus a ^^^ line under the error."""
+    ctx = str(match["context"]).replace("\n", " ")
+    offset, length = match.get("context_offset"), match.get("length") or 0
+    if offset is None or length <= 0:
+        return ctx
+    return f"{ctx}\n{' ' * offset}{'^' * length}"
+
+
+def _grammar_results_key(page_name: str) -> str:
+    return f"_grammar_results_{page_name}"
+
+
+def _apply_grammar_fixes(page_name: str, field_names: list[str]) -> None:
+    """Button callback: runs before widgets are drawn, so widget state can be set.
+
+    A field is only overwritten if it still holds the exact text that was
+    checked; otherwise the user's newer edits would be lost.
+    """
+    results = st.session_state.get(_grammar_results_key(page_name), {})
+    skipped: list[str] = []
+    for field_name in field_names:
+        result = results.pop(field_name, None)
+        if result is None:
+            continue
+        key = editor_key(field_name)
+        if st.session_state.get(key) == result["original"]:
+            st.session_state[key] = result["corrected"]
+        else:
+            skipped.append(_GRAMMAR_LABELS.get(field_name, field_name))
+    st.session_state[f"_grammar_skipped_{page_name}"] = skipped
+    clear_generated_pdfs()
+
+
+def _clear_grammar_results(page_name: str) -> None:
+    st.session_state.pop(_grammar_results_key(page_name), None)
+    st.session_state.pop(f"_grammar_skipped_{page_name}", None)
 
 
 def default_data() -> SyllabusData:
@@ -177,28 +252,49 @@ def apply_extracted_fields(extracted: dict[str, Any]) -> None:
     clear_generated_pdfs()
 
 
+def keep_editor_state() -> None:
+    """Stop Streamlit from deleting the state of widgets not drawn in this run.
+
+    Streamlit removes a keyed widget's value when a rerun does not draw that
+    widget (e.g. the Theory/Lab page the user isn't viewing). Re-assigning each
+    key at the top of the script turns it into normal session state, so it
+    survives page switches. Must run before any editor widget is created.
+    """
+    for field_name in syllabus_field_names():
+        key = editor_key(field_name)
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+
+
 def text_input(label: str, field_name: str, **kwargs: Any) -> str:
-    # Streamlit drops a keyed widget's bound value whenever a rerun does not
-    # instantiate that widget (e.g. the Theory/Lab page the user isn't
-    # viewing), so it renders blank the next time it reappears even though
-    # session_state still has the right value. Passing `value=` explicitly
-    # re-seeds it; `key=` still wins on reruns where the user has typed a
-    # different value, so in-progress edits are unaffected.
-    key = editor_key(field_name)
-    kwargs.setdefault("value", st.session_state.get(key))
-    return st.text_input(label, key=key, on_change=clear_generated_pdfs, **kwargs)
+    return st.text_input(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
 
 
 def text_area(label: str, field_name: str, **kwargs: Any) -> str:
-    key = editor_key(field_name)
-    kwargs.setdefault("value", st.session_state.get(key))
-    return st.text_area(label, key=key, on_change=clear_generated_pdfs, **kwargs)
+    return st.text_area(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
 
 
 def checkbox(label: str, field_name: str, **kwargs: Any) -> bool:
-    key = editor_key(field_name)
-    kwargs.setdefault("value", st.session_state.get(key))
-    return st.checkbox(label, key=key, on_change=clear_generated_pdfs, **kwargs)
+    return st.checkbox(label, key=editor_key(field_name), on_change=clear_generated_pdfs, **kwargs)
+
+
+# "UNIT III: Title" for theory syllabi; "Phase I: ..." for Project/Internship weekly plans.
+_UNIT_HEADING_RE = re.compile(r"^(?:UNIT\s+[IVXL]+\s*:|PHASE\b)", re.IGNORECASE)
+MAX_BOOKS = 3
+
+
+def render_theory_warnings(data: SyllabusData) -> None:
+    """Soft checks for the formats the field labels ask for."""
+    bad_headings = [heading for heading, _ in data.units if not _UNIT_HEADING_RE.match(heading)]
+    if bad_headings:
+        st.warning(
+            "These unit headings do not follow the format `UNIT III: Title` "
+            "(or a blank line is missing between units): "
+            + "; ".join(f"`{h}`" for h in bad_headings)
+        )
+    for label, items in (("Text Books", data.textbooks), ("Reference Books", data.reference_books)):
+        if len(items) > MAX_BOOKS:
+            st.warning(f"{label}: {len(items)} entries found, maximum is {MAX_BOOKS}.")
 
 
 def render_grammar_panel(page_name: str) -> None:
@@ -214,10 +310,11 @@ def render_grammar_panel(page_name: str) -> None:
 
         st.caption(
             "Checks spelling and grammar in text fields using LanguageTool. "
-            "Java must be installed on this machine for the local engine to start."
+            "Uses the local engine if Java is installed, otherwise the free public "
+            "LanguageTool service (text is sent to languagetool.org, with rate limits)."
         )
 
-        results_key = f"_grammar_results_{page_name}"
+        results_key = _grammar_results_key(page_name)
 
         col_check, col_clear = st.columns([1, 1])
         with col_check:
@@ -228,35 +325,49 @@ def render_grammar_panel(page_name: str) -> None:
                 use_container_width=True,
             )
         with col_clear:
-            if st.button(
+            st.button(
                 "Clear Results",
                 key=f"_grammar_clear_{page_name}",
                 use_container_width=True,
-            ):
-                st.session_state.pop(results_key, None)
-                st.rerun()
+                on_click=_clear_grammar_results,
+                args=(page_name,),
+            )
 
         if run_check:
+            st.session_state.pop(f"_grammar_skipped_{page_name}", None)
             tool = _load_grammar_tool()
             if tool is None:
                 st.error(
-                    "Grammar engine failed to start. "
-                    "Make sure **Java** is installed and on your PATH, then restart the app."
+                    "Grammar engine failed to start, and the public LanguageTool "
+                    "service could not be reached. Install **Java** or check the "
+                    "internet connection, then click Check Grammar again."
                 )
             else:
                 results: dict[str, dict] = {}
                 fields_to_check = _GRAMMAR_FIELDS.get(page_name, [])
-                with st.spinner("Checking grammar…"):
-                    for field_name in fields_to_check:
-                        text = str(st.session_state.get(editor_key(field_name), ""))
-                        matches, corrected = _check_text(text)
-                        if matches:
-                            results[field_name] = {
-                                "original": text,
-                                "corrected": corrected,
-                                "matches": matches,
-                            }
-                st.session_state[results_key] = results
+                try:
+                    with st.spinner("Checking grammar…"):
+                        for field_name in fields_to_check:
+                            text = str(st.session_state.get(editor_key(field_name), ""))
+                            matches, corrected = _check_text(text)
+                            if matches:
+                                results[field_name] = {
+                                    "original": text,
+                                    "corrected": corrected,
+                                    "matches": matches,
+                                }
+                except Exception as exc:
+                    st.error(f"Grammar check failed: {exc}")
+                else:
+                    st.session_state[results_key] = results
+
+        skipped = st.session_state.get(f"_grammar_skipped_{page_name}")
+        if skipped:
+            st.warning(
+                "Not applied because the text was edited after the check: "
+                + ", ".join(skipped)
+                + ". Click **Check Grammar** again."
+            )
 
         results = st.session_state.get(results_key)
         if results is None:
@@ -269,17 +380,17 @@ def render_grammar_panel(page_name: str) -> None:
         total = sum(len(r["matches"]) for r in results.values())
         st.warning(f"Found **{total}** issue(s) across **{len(results)}** field(s).")
 
-        # Apply-all button at the top for convenience.
-        if st.button(
-            "✅ Apply All Fixes",
-            key=f"_grammar_apply_all_{page_name}",
-            type="primary",
-        ):
-            for field_name, data in results.items():
-                st.session_state[editor_key(field_name)] = data["corrected"]
-            st.session_state.pop(results_key, None)
-            clear_generated_pdfs()
-            st.rerun()
+        apply_all_fields = [f for f in results if f not in _APPLY_ALL_EXCLUDED]
+        if apply_all_fields:
+            st.button(
+                "✅ Apply All Fixes (book lists excluded)",
+                key=f"_grammar_apply_all_{page_name}",
+                type="primary",
+                on_click=_apply_grammar_fixes,
+                args=(page_name, apply_all_fields),
+                help="Book lists contain author names that are often flagged wrongly. "
+                "Review and apply those one field at a time below.",
+            )
 
         st.divider()
 
@@ -289,9 +400,7 @@ def render_grammar_panel(page_name: str) -> None:
             with st.expander(f"📝 **{label}** — {n} issue(s)", expanded=True):
                 for i, m in enumerate(data["matches"], start=1):
                     st.markdown(f"**Issue {i}:** {m['message']}")
-                    # Show context with the error portion highlighted.
-                    ctx = m["context"]
-                    st.code(ctx, language=None)
+                    st.code(_context_with_marker(m), language=None)
                     if m["replacements"]:
                         suggestions = " · ".join(f"`{r}`" for r in m["replacements"])
                         st.markdown(f"💡 **Suggestion(s):** {suggestions}")
@@ -307,14 +416,12 @@ def render_grammar_panel(page_name: str) -> None:
                     key=f"_grammar_preview_{field_name}",
                     label_visibility="collapsed",
                 )
-                if st.button(
+                st.button(
                     f"Apply fixes to {label}",
                     key=f"_grammar_apply_{field_name}",
-                ):
-                    st.session_state[editor_key(field_name)] = data["corrected"]
-                    del st.session_state[results_key][field_name]
-                    clear_generated_pdfs()
-                    st.rerun()
+                    on_click=_apply_grammar_fixes,
+                    args=(page_name, [field_name]),
+                )
 
 
 def render_signatory_controls(page_name: str, checkbox_attr: str) -> None:
@@ -332,11 +439,13 @@ def render_signatory_controls(page_name: str, checkbox_attr: str) -> None:
         text_input("Signature 3", "principal")
 
 
-def render_export_panel(page_name: str, latex_content: str, file_stem: str) -> None:
+def render_export_panel(page_name: str, latex_content: str, file_stem: str, signed: bool) -> None:
     st.subheader(f"{page_name} Downloads")
     st.caption("Generate this page only. Theory and Lab downloads are separate and do not include each other.")
 
     pdf_state_key = f"{file_stem}_pdf_bytes"
+    # Different names so the signed and unsigned PDFs don't overwrite each other.
+    pdf_name = f"{file_stem}_{'with' if signed else 'without'}_signature.pdf"
     preview_tab, latex_tab = st.tabs(["Generate & Download", "LaTeX Source"])
 
     with preview_tab:
@@ -348,6 +457,10 @@ def render_export_panel(page_name: str, latex_content: str, file_stem: str) -> N
             key=f"download_{file_stem}_latex_direct",
         )
 
+        st.caption(
+            ":red[**Two PDFs are required:** one with and one without the signature box.] "
+            "Generate and download once, then switch the signatory checkbox above and repeat."
+        )
         if st.button(f"Generate {page_name} PDF", type="primary", key=f"generate_{file_stem}_pdf"):
             try:
                 pdf_bytes, _ = compile_pdf(latex_content, output_stem=file_stem)
@@ -360,9 +473,9 @@ def render_export_panel(page_name: str, latex_content: str, file_stem: str) -> N
 
         if pdf_state_key in st.session_state:
             st.download_button(
-                f"Download {page_name} PDF :red[**(2 PDF required with and without signature box)**]",
+                f"Download {page_name} PDF ({'with' if signed else 'without'} signatures)",
                 data=st.session_state[pdf_state_key],
-                file_name=f"{file_stem}.pdf",
+                file_name=pdf_name,
                 mime="application/pdf",
                 key=f"download_{file_stem}_pdf",
             )
@@ -376,6 +489,7 @@ if "data" not in st.session_state:
 
 
 data: SyllabusData = st.session_state.data
+keep_editor_state()
 initialize_editor_state(data)
 sync_data_from_editor_state(data)
 
@@ -470,10 +584,13 @@ if current_page == "Theory Page":
     )
 
     sync_data_from_editor_state(data)
+    render_theory_warnings(data)
     render_grammar_panel("Theory Page")
     render_signatory_controls("Theory", "include_theory_signature_box")
     sync_data_from_editor_state(data)
-    render_export_panel("Theory", render_theory_latex(data), "theory_syllabus")
+    render_export_panel(
+        "Theory", render_theory_latex(data), "theory_syllabus", data.include_theory_signature_box
+    )
 
 else:
     st.subheader("Lab Details")
@@ -497,8 +614,7 @@ else:
     text_input("Experiments Heading", "experiments_heading")
     text_area("Experiments", "experiments", height=400)
 
-    sync_data_from_editor_state(data)
     render_grammar_panel("Lab Page")
     render_signatory_controls("Lab", "include_lab_signature_box")
     sync_data_from_editor_state(data)
-    render_export_panel("Lab", render_lab_latex(data), "lab_syllabus")
+    render_export_panel("Lab", render_lab_latex(data), "lab_syllabus", data.include_lab_signature_box)

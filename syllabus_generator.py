@@ -245,7 +245,9 @@ def _document(content: str, data: SyllabusData, include_signatures: bool) -> str
 \PackageError{{syllabus-generator}}{{This template requires XeLaTeX or LuaLaTeX for Times New Roman}}{{Use xelatex or lualatex to compile this document.}}
 \else
 \usepackage{{fontspec}}
-\setmainfont{{Times New Roman}}
+% Times New Roman is not installed on Linux hosts (e.g. Streamlit Cloud);
+% TeX Gyre Termes is a free, near-identical Times clone.
+\IfFontExistsTF{{Times New Roman}}{{\setmainfont{{Times New Roman}}}}{{\setmainfont{{TeX Gyre Termes}}}}
 \fi
 \usepackage[margin=1in, bottom=1.5in]{{geometry}}
 \usepackage[table]{{xcolor}}
@@ -430,12 +432,32 @@ def render_latex(data: SyllabusData) -> str:
     return render_theory_latex(data)
 
 
+TEX_TIMEOUT_SECONDS = 120
+LOG_TAIL_LINES = 40
+
+
 def _run_tex(command: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, check=False,
+            timeout=TEX_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{command[0]} did not finish within {TEX_TIMEOUT_SECONDS} seconds."
+        ) from exc
+
+
+def _log_tail(log: str) -> str:
+    """Keep only the end of the TeX log, where the real error usually is."""
+    lines = log.strip().splitlines()
+    if len(lines) <= LOG_TAIL_LINES:
+        return "\n".join(lines)
+    return "... (log shortened)\n" + "\n".join(lines[-LOG_TAIL_LINES:])
 
 
 def compile_pdf(latex_content: str, output_stem: str = "syllabus") -> tuple[bytes, str]:
-    """Compile via a Unicode engine so Times New Roman is honored.
+    r"""Compile via a Unicode engine so Times New Roman is honored.
 
     The LaTeX template uses fontspec with \setmainfont{Times New Roman}, which
     requires XeLaTeX or LuaLaTeX.
@@ -484,4 +506,4 @@ def compile_pdf(latex_content: str, output_stem: str = "syllabus") -> tuple[byte
                 return pdf_path.read_bytes(), latex_content
             log = (result.stdout or "") + "\n" + (result.stderr or "")
 
-        raise RuntimeError(log.strip() or "PDF compilation failed.")
+        raise RuntimeError(_log_tail(log) or "PDF compilation failed.")

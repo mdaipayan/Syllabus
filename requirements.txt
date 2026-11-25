@@ -1,3 +1,3 @@
-streamlit
-pdfplumber
-language_tool_python
+streamlit>=1.37,<2
+pdfplumber>=0.10,<1
+language_tool_python>=2.7,<4

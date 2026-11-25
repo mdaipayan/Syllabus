@@ -10,7 +10,7 @@ A Streamlit app that lets users edit syllabus fields, generate a new LaTeX sylla
 - Keep Lab content separate from the Theory PDF with no side-panel include toggle
 - Turn bottom signatories on or off per page
 - Generate and download separate `.tex` and PDF files for Theory and Lab using `latexmk`
-- Use the actual Times New Roman system font via `fontspec` when compiling with XeLaTeX or LuaLaTeX
+- Use the actual Times New Roman system font via `fontspec` when compiling with XeLaTeX or LuaLaTeX; falls back to TeX Gyre Termes (a free Times clone) where Times New Roman is not installed, e.g. on Streamlit Cloud
 - Ready to push to GitHub and deploy on Streamlit Community Cloud
 
 ## Files
@@ -39,5 +39,6 @@ A Streamlit app that lets users edit syllabus fields, generate a new LaTeX sylla
 ## Notes
 
 - The app escapes LaTeX-sensitive characters entered by users.
-- PDF generation depends on `latexmk` being available on the host machine.
+- PDF generation depends on `latexmk` and XeLaTeX being available on the host machine (`packages.txt` installs them on Streamlit Cloud).
+- Grammar check uses the local LanguageTool engine when Java is installed, otherwise the public LanguageTool API (text is sent to languagetool.org). "Apply All" skips the book lists because author names are often flagged wrongly.
 - PDF import (`pdfplumber`) reads text-based PDFs only; scanned/image-only PDFs are not supported. Every field is best-effort, so review the auto-filled values before generating.
